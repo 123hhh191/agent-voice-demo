@@ -1,0 +1,25 @@
+package com.example.agentvoice.voice;
+
+import java.io.ByteArrayOutputStream;
+import java.time.Instant;
+import java.util.UUID;
+
+/** Bounded node-local audio state; audio is intentionally not persisted to SQL or Redis. */
+public final class TurnState {
+    private final UUID turnId,attemptId; private volatile long ownerVersion; private final long startedNanos; private final int maxBytes;
+    private final FrameSequencer sequencer; private final ByteArrayOutputStream audio=new ByteArrayOutputStream();
+    private long lastSeq=-1; private boolean ended; private long expectedLastSeq=-1; private boolean finalizing; private boolean deliverySent;
+    public TurnState(UUID turnId,UUID attemptId,long ownerVersion,int maxBytes,int reorderLimit,long startedNanos){this.turnId=turnId;this.attemptId=attemptId;this.ownerVersion=ownerVersion;this.maxBytes=maxBytes;this.sequencer=new FrameSequencer(reorderLimit);this.startedNanos=startedNanos;}
+    public synchronized FrameSequencer.Result accept(AudioFrameCodec.Frame f){if(!f.turnId().equals(turnId)||!f.attemptId().equals(attemptId))throw new AudioFrameCodec.FrameException("STALE_ATTEMPT");if(f.seq()>1499||f.captureOffsetMs()<0||f.durationMs()<1||f.captureOffsetMs()+f.durationMs()>30_000||f.payload().length!=(f.sampleRate()*f.channels()*2*f.durationMs()/1000))throw new AudioFrameCodec.FrameException("INVALID_FRAME");if(System.nanoTime()-startedNanos>java.util.concurrent.TimeUnit.SECONDS.toNanos(30))throw new AudioFrameCodec.FrameException("TURN_DEADLINE_EXCEEDED");if(expectedLastSeq>=0&&(f.seq()>expectedLastSeq||f.last()!=(f.seq()==expectedLastSeq)))throw new AudioFrameCodec.FrameException("INVALID_SEQUENCE");var result=sequencer.accept(f);for(var contiguous:result.contiguous()){if(audio.size()+contiguous.payload().length>maxBytes)throw new AudioFrameCodec.FrameException("AUDIO_LIMIT_EXCEEDED");audio.writeBytes(contiguous.payload());if(contiguous.last()){ended=true;lastSeq=contiguous.seq();}}return result;}
+    public synchronized byte[] audio(){return audio.toByteArray();}
+    public synchronized boolean complete(){return ended&&sequencer.receivedThrough()>=lastSeq;}
+    public synchronized long receivedThrough(){return sequencer.receivedThrough();}
+    public synchronized void end(long seq){if(seq<0||seq>1_499)throw new AudioFrameCodec.FrameException("INVALID_SEQUENCE");if(expectedLastSeq>=0&&expectedLastSeq!=seq)throw new AudioFrameCodec.FrameException("INVALID_SEQUENCE");expectedLastSeq=seq;if(sequencer.receivedThrough()>seq||sequencer.highestPending()>seq)throw new AudioFrameCodec.FrameException("INVALID_SEQUENCE");}
+    public synchronized boolean endComplete(){return expectedLastSeq>=0&&sequencer.receivedThrough()==expectedLastSeq&&ended&&lastSeq==expectedLastSeq;}
+    public synchronized boolean claimFinalize(){if(finalizing||!endComplete())return false;finalizing=true;return true;}
+    public synchronized boolean claimDelivery(){if(deliverySent)return false;deliverySent=true;return true;}
+    public synchronized long expectedLastSeq(){return expectedLastSeq;}
+    public void rebind(long version){ownerVersion=version;}
+    public synchronized java.util.List<FrameSequencer.Range> missingRanges(){return sequencer.missingRanges();}
+    public long ownerVersion(){return ownerVersion;}public UUID turnId(){return turnId;}public UUID attemptId(){return attemptId;}public long startedNanos(){return startedNanos;}
+}
