@@ -1,0 +1,23 @@
+# 本地服务连接配置；账号密码仅从运行环境提供。
+spring:
+  datasource:
+    url: jdbc:mysql://127.0.0.1:3306/agent_voice_demo?useSSL=false&allowPublicKeyRetrieval=true&connectionTimeZone=UTC&forceConnectionTimeZoneToSession=true&characterEncoding=utf8
+
+    username:
+    password:
+    driver-class-name: com.mysql.cj.jdbc.Driver
+  data:
+    redis:
+      host: ${REDIS_HOST:127.0.0.1}
+      port: ${REDIS_PORT:6379}
+
+
+mybatis:
+  configuration:
+    map-underscore-to-camel-case: true
+
+app:
+  demo-auth:
+    enabled: true
+
+# local 会启用数据库、Redis 客户端和模型调用；滑窗限流默认单机内存，可显式切换 Redis 共享额度。

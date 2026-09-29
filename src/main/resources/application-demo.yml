@@ -1,0 +1,7 @@
+# 仅限本机演示：通过 X-Demo-User-Id 提供隔离身份；不可用于生产。
+spring:
+  config:
+    import: optional:classpath:application-local.yml
+app:
+  demo-auth:
+    enabled: true

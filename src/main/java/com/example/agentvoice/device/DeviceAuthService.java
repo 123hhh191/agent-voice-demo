@@ -37,7 +37,6 @@ public class DeviceAuthService {
         this.credentials=parseCredentials(configuredCredentials);
     }
 
-    /** Issues a short-lived, single-use challenge only for an enabled, configured device. */
     /** 为已登记设备签发一次性随机挑战。 */
     public Challenge challenge(String deviceId,String sn) {
         var devices=jdbc.query("SELECT enabled FROM device_registry WHERE device_id=? AND sn=?",(rs,n)->rs.getBoolean(1),deviceId,sn);
@@ -50,9 +49,8 @@ public class DeviceAuthService {
         return new Challenge(challengeId,nonceText,expires.toString());
     }
 
-    /** Verifies the signed nonce and atomically consumes the challenge while creating an opaque token. */
-    @Transactional
     /** 验证挑战签名并签发短期设备访问令牌。 */
+    @Transactional
     public Token token(TokenRequest request) {
         byte[] secret=credentials.get(request.deviceId());
         if(secret==null) throw unauthorized();
@@ -70,7 +68,6 @@ public class DeviceAuthService {
         return new Token(accessToken,TOKEN_TTL.toSeconds(),"DEVICE_BOUND_REPLAY");
     }
 
-    /** Resolves an unexpired bearer token to its registered device identity. */
     /** 校验访问令牌有效期和设备状态，返回设备 ID。 */
     public String authenticate(String bearer) {
         if(bearer==null||bearer.length()<32||bearer.length()>256)throw unauthorized();
@@ -94,8 +91,8 @@ public class DeviceAuthService {
             String id=item.substring(0,ix).trim(); if(!id.matches("[A-Za-z0-9._:-]{1,96}")||parsed.containsKey(id))throw new IllegalArgumentException("invalid or duplicate device credential id");byte[] key=Base64.getDecoder().decode(item.substring(ix+1).trim()); if(key.length<32)throw new IllegalArgumentException("device HMAC credential must contain at least 256 bits"); parsed.put(id,key); }
         return Map.copyOf(parsed);
     }
-    @Scheduled(fixedDelayString="${app.device.cleanup-interval-ms:3600000}")
     /** 清除过期挑战及过期或已撤销的访问令牌。 */
+    @Scheduled(fixedDelayString="${app.device.cleanup-interval-ms:3600000}")
     public void cleanupExpired(){jdbc.update("DELETE FROM device_challenge WHERE expires_at<CURRENT_TIMESTAMP(6)");jdbc.update("DELETE FROM device_access_token WHERE expires_at<CURRENT_TIMESTAMP(6) OR revoked_at<CURRENT_TIMESTAMP(6)-INTERVAL 1 DAY");}
     private String randomToken(){byte[] b=new byte[32];random.nextBytes(b);return Base64.getUrlEncoder().withoutPadding().encodeToString(b);}
     private String hmac(byte[] key,String value){try{Mac mac=Mac.getInstance("HmacSHA256");mac.init(new SecretKeySpec(key,"HmacSHA256"));return HexFormat.of().formatHex(mac.doFinal(value.getBytes(StandardCharsets.UTF_8)));}catch(Exception ex){throw new IllegalStateException(ex);}}

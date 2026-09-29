@@ -1,0 +1,43 @@
+spring:
+  application:
+    name: agent-voice-demo
+  profiles:
+    default: local
+
+server:
+  address: ${SERVER_ADDRESS:127.0.0.1}
+  port: ${SERVER_PORT:8080}
+
+management:
+  endpoints:
+    web:
+      exposure:
+        include: health,info
+  endpoint:
+    health:
+      show-details: never
+
+app:
+  deepseek:
+    base-url: https://api.deepseek.com
+    model: ${DEEPSEEK_MODEL:deepseek-flash}
+    thinking-mode: disabled
+    connect-timeout: ${DEEPSEEK_CONNECT_TIMEOUT:3s}
+    read-timeout: ${DEEPSEEK_READ_TIMEOUT:30s}
+    max-decisions: ${AGENT_MAX_DECISIONS:8}
+    context-soft-token-budget: ${AGENT_CONTEXT_SOFT_TOKEN_BUDGET:12000}
+    max-input-chars: ${AGENT_MAX_INPUT_CHARS:8000}
+    max-page-size: ${AGENT_MAX_PAGE_SIZE:100}
+  device:
+    # Format: deviceId=base64-encoded-256-bit-key;deviceId2=base64-key
+    credentials: ${DEVICE_CREDENTIALS:}
+  voice:
+    board-model: ${VOICE_BOARD_MODEL:MODEL_A}
+    asr-provider: ${VOICE_ASR_PROVIDER:MOCK_A}
+    reopen-policy: ${VOICE_REOPEN_POLICY:WAIT_WAKEUP}
+    max-active-turns: ${VOICE_MAX_ACTIVE_TURNS:64}
+    max-audio-bytes: ${VOICE_MAX_AUDIO_BYTES:960000}
+    reorder-limit: ${VOICE_REORDER_LIMIT:64}
+    gap-wait-ms: ${VOICE_GAP_WAIT_MS:1000}
+    finalization-timeout-ms: ${VOICE_FINALIZATION_TIMEOUT_MS:10000}
+    cleanup-interval-ms: ${VOICE_CLEANUP_INTERVAL_MS:5000}
