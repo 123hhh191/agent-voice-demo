@@ -21,6 +21,7 @@ import java.util.concurrent.ConcurrentHashMap;
 public final class VoiceTurnCoordinator {
     public enum State { IDLE, LISTENING, SPEAKING, FINALIZING, DIALOGUE_PENDING, PLAYING, FAILED }
     public enum ReopenPolicy { WAIT_WAKEUP, AUTO_LISTEN }
+    public enum PlaybackResult { APPLIED, ALREADY_APPLIED, REJECTED }
     private final AudioNormalizer normalizer=new AudioNormalizer(); private final AsrProviderAdapter asr; private final DialogueClient dialogue;
     private final AudioOutputAdapter output; private final CommandDispatcher commands; private final ReopenPolicy policy;
     private final Map<String,Turn> turns=new ConcurrentHashMap<>();
@@ -57,7 +58,13 @@ public final class VoiceTurnCoordinator {
     }
     public synchronized DeviceCommand cancel(String deviceId,String turnId,String attemptId) { Turn t=require(deviceId,turnId,attemptId);DeviceCommand stop=null;if(t.state==State.PLAYING){stop=new DeviceCommand(UUID.randomUUID().toString(),deviceId,turnId,DeviceCommand.Type.STOP_PLAYBACK,2,Instant.now().plusSeconds(10),Map.of("reason","turn_cancelled"));commands.persist(stop);}t.asr.cancel();t.asr.close();t.state=State.IDLE;return stop; }
     public synchronized void commandAck(String deviceId,String turnId,String commandId) { Turn t=turns.get(deviceId);if(t==null||!t.turnId.equals(turnId)||t.state!=State.PLAYING||!t.commandId.equals(commandId))throw new IllegalArgumentException("stale command ACK");if(!commands.acknowledge(deviceId,turnId,commandId))throw new IllegalArgumentException("command expired or unknown"); }
-    public synchronized void playbackFinished(String deviceId,String turnId,String commandId) { Turn t=turns.get(deviceId);if(t==null||!t.turnId.equals(turnId)||t.state!=State.PLAYING||!t.commandId.equals(commandId))return;commands.playbackFinished(deviceId,turnId,commandId);t.state=State.IDLE; }
+    /** Clears only the matching in-memory turn after VoicePlaybackService has committed it. */
+    public synchronized PlaybackResult playbackFinished(String deviceId,String turnId,String commandId) {
+        Turn t=turns.get(deviceId);
+        if(t==null)return PlaybackResult.ALREADY_APPLIED;
+        if(!t.deviceId.equals(deviceId)||!t.turnId.equals(turnId)||t.state!=State.PLAYING||!commandId.equals(t.commandId))return PlaybackResult.REJECTED;
+        return turns.remove(deviceId,t)?PlaybackResult.APPLIED:PlaybackResult.REJECTED;
+    }
     public synchronized State state(String deviceId){Turn t=turns.get(deviceId);return t==null?State.IDLE:t.state;}
     public ReopenPolicy reopenPolicy(){return policy;}
     public synchronized String finalText(String deviceId,String turnId){Turn t=turns.get(deviceId);return t!=null&&t.turnId.equals(turnId)?t.finalText:null;}

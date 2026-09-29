@@ -4,6 +4,8 @@ import org.springframework.stereotype.Component;
 import org.springframework.jdbc.core.JdbcTemplate;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import org.springframework.scheduling.annotation.Scheduled;
+import org.springframework.transaction.support.TransactionSynchronization;
+import org.springframework.transaction.support.TransactionSynchronizationManager;
 import java.time.Instant;
 import java.util.Map;
 import java.util.concurrent.ConcurrentHashMap;
@@ -18,11 +20,24 @@ public final class CommandDispatcher {
     private final java.util.Set<String> acknowledged=ConcurrentHashMap.newKeySet();
     public void persist(DeviceCommand command) {
         if (command.deadline().isBefore(Instant.now())) throw new IllegalStateException("command expired");
-        DeviceCommand old=pending.putIfAbsent(command.commandId(),command);
-        if(old!=null&&!old.equals(command))throw new IllegalArgumentException("commandId reused with different command");
-        try{jdbc.update("INSERT INTO device_command(command_id,device_id,turn_id,event_seq,command_type,payload_json,deadline_at) VALUES(?,?,?,?,?,?,?)",command.commandId(),command.deviceId(),command.turnId(),command.eventSeq(),command.type().name(),mapper.writeValueAsString(command.payload()),java.sql.Timestamp.from(command.deadline()));}
-        catch(org.springframework.dao.DuplicateKeyException duplicate){String existing=jdbc.queryForObject("SELECT device_id FROM device_command WHERE command_id=?",String.class,command.commandId());if(!command.deviceId().equals(existing))throw new IllegalArgumentException("commandId conflict",duplicate);}
-        catch(com.fasterxml.jackson.core.JsonProcessingException e){pending.remove(command.commandId(),command);throw new IllegalArgumentException("command payload cannot be serialized",e);}
+        String payloadJson;
+        try{payloadJson=mapper.writeValueAsString(command.payload());}
+        catch(com.fasterxml.jackson.core.JsonProcessingException e){throw new IllegalArgumentException("command payload cannot be serialized",e);}
+        boolean inserted=true;
+        try{jdbc.update("INSERT INTO device_command(command_id,device_id,turn_id,event_seq,command_type,payload_json,deadline_at) VALUES(?,?,?,?,?,?,?)",command.commandId(),command.deviceId(),command.turnId(),command.eventSeq(),command.type().name(),payloadJson,java.sql.Timestamp.from(command.deadline()));}
+        catch(org.springframework.dao.DuplicateKeyException duplicate){
+            var rows=jdbc.query("SELECT device_id,turn_id,event_seq,command_type,payload_json,deadline_at,acked_at,playback_finished_at FROM device_command WHERE command_id=?",
+                    (rs,n)->new Object[]{rs.getString(1),rs.getString(2),rs.getLong(3),rs.getString(4),rs.getString(5),rs.getTimestamp(6).toInstant(),rs.getTimestamp(7)!=null,rs.getTimestamp(8)!=null},command.commandId());
+            if(rows.isEmpty())throw new IllegalArgumentException("commandId conflict",duplicate);
+            Object[] existing=rows.get(0);
+            boolean same=command.deviceId().equals(existing[0])&&command.turnId().equals(existing[1])&&command.eventSeq()==(long)existing[2]
+                    &&command.type().name().equals(existing[3])&&command.deadline().equals(existing[5])&&samePayload(payloadJson,(String)existing[4]);
+            if(!same)throw new IllegalArgumentException("commandId reused with different command",duplicate);
+            inserted=false;
+            boolean alreadyAcked=(boolean)existing[6],alreadyFinished=(boolean)existing[7];
+            afterCommit(()->{if(alreadyFinished)return;pending.putIfAbsent(command.commandId(),command);if(alreadyAcked)acknowledged.add(command.commandId());});
+        }
+        if(inserted)afterCommit(()->pending.putIfAbsent(command.commandId(),command));
     }
     public boolean acknowledge(String commandId){DeviceCommand command=pending.get(commandId);return command!=null&&acknowledge(command.deviceId(),command.turnId(),commandId);}
     public boolean acknowledge(String deviceId,String turnId,String commandId){
@@ -38,9 +53,11 @@ public final class CommandDispatcher {
         if(rows.isEmpty())return null;Object[] r=rows.get(0);String id=(String)r[0];DeviceCommand command=pending.computeIfAbsent(id,k->{try{return new DeviceCommand(id,deviceId,turnId,DeviceCommand.Type.valueOf((String)r[1]),(long)r[2],(Instant)r[4],mapper.readValue((String)r[3],new com.fasterxml.jackson.core.type.TypeReference<Map<String,Object>>(){}));}catch(Exception e){throw new IllegalStateException("stored command is invalid",e);}});if(Boolean.TRUE.equals(r[5]))acknowledged.add(id);return command;
     }
     public boolean hasPendingPlayback(String deviceId,String turnId){return !jdbc.query("SELECT command_id FROM device_command WHERE device_id=? AND turn_id=? AND command_type='PLAY_AUDIO' AND playback_finished_at IS NULL AND deadline_at>CURRENT_TIMESTAMP(6)",(rs,n)->rs.getString(1),deviceId,turnId).isEmpty();}
-    public void playbackFinished(String deviceId,String turnId,String commandId){DeviceCommand c=pending.get(commandId);if(c==null)c=findById(commandId);if(c==null||!c.deviceId().equals(deviceId)||!c.turnId().equals(turnId)||!isAcknowledged(commandId))throw new IllegalArgumentException("stale playback completion");int changed=jdbc.update("UPDATE device_command SET playback_finished_at=COALESCE(playback_finished_at,CURRENT_TIMESTAMP(6)) WHERE command_id=? AND device_id=? AND turn_id=? AND acked_at IS NOT NULL AND deadline_at>CURRENT_TIMESTAMP(6)",commandId,deviceId,turnId);if(changed==0&&!alreadyFinished(commandId))throw new IllegalArgumentException("playback command expired");pending.remove(commandId,c);acknowledged.remove(commandId);}
+    /** Drops local command state only after VoicePlaybackService commits the durable receipt. */
+    public void playbackCommitted(String commandId){pending.remove(commandId);acknowledged.remove(commandId);}
     private boolean isAcknowledged(String id){if(acknowledged.contains(id))return true;Boolean value=jdbc.query("SELECT acked_at IS NOT NULL FROM device_command WHERE command_id=?",rs->rs.next()&&rs.getBoolean(1),id);if(Boolean.TRUE.equals(value))acknowledged.add(id);return Boolean.TRUE.equals(value);}
-    private boolean alreadyFinished(String id){Boolean value=jdbc.query("SELECT playback_finished_at IS NOT NULL FROM device_command WHERE command_id=?",rs->rs.next()&&rs.getBoolean(1),id);return Boolean.TRUE.equals(value);}
+    private boolean samePayload(String left,String right){try{return mapper.readTree(left).equals(mapper.readTree(right));}catch(Exception ex){return false;}}
+    private void afterCommit(Runnable action){if(!TransactionSynchronizationManager.isSynchronizationActive()){action.run();return;}TransactionSynchronizationManager.registerSynchronization(new TransactionSynchronization(){@Override public void afterCommit(){action.run();}});}
     private DeviceCommand findById(String id){var rows=jdbc.query("SELECT device_id,turn_id,command_type,event_seq,payload_json,deadline_at,acked_at FROM device_command WHERE command_id=? AND playback_finished_at IS NULL AND deadline_at>CURRENT_TIMESTAMP(6)",(rs,n)->new Object[]{rs.getString(1),rs.getString(2),rs.getString(3),rs.getLong(4),rs.getString(5),rs.getTimestamp(6).toInstant(),rs.getTimestamp(7)!=null},id);if(rows.isEmpty())return null;Object[] r=rows.get(0);try{DeviceCommand c=new DeviceCommand(id,(String)r[0],(String)r[1],DeviceCommand.Type.valueOf((String)r[2]),(long)r[3],(Instant)r[5],mapper.readValue((String)r[4],new com.fasterxml.jackson.core.type.TypeReference<Map<String,Object>>(){}));pending.putIfAbsent(id,c);if(Boolean.TRUE.equals(r[6]))acknowledged.add(id);return pending.get(id);}catch(Exception e){throw new IllegalStateException("stored command is invalid",e);}}
     @Scheduled(fixedDelayString="${app.voice.command-cleanup-interval-ms:60000}")
     public void cleanupExpired(){Instant now=Instant.now();pending.entrySet().removeIf(e->{if(e.getValue().deadline().isAfter(now))return false;acknowledged.remove(e.getKey());return true;});}

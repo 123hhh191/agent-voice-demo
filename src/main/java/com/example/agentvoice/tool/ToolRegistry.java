@@ -36,13 +36,16 @@ public class ToolRegistry {
     public Object execute(String name, String json, ToolExecutionContext context) {
         Tool tool = tools.get(name);
         if (tool == null) throw new ApiException(HttpStatus.BAD_REQUEST, "UNKNOWN_TOOL", "不支持的工具");
+        JsonNode args;
         try {
-            JsonNode args = mapper.readTree(json);
+            args = mapper.readTree(json);
             if (!args.isObject()) throw new IllegalArgumentException();
             validateSchema(args, tool);
-            return tool.action().apply(args, context);
         } catch (ApiException e) { throw e; }
         catch (Exception e) { throw new ApiException(HttpStatus.BAD_REQUEST, "INVALID_TOOL_ARGUMENTS", "工具参数无效"); }
+
+        // Tool execution can fail because of business rules or infrastructure; preserve that error.
+        return tool.action().apply(args, context);
     }
     private void validateSchema(JsonNode args, Tool tool) {
         var fields = args.fieldNames();
@@ -52,7 +55,7 @@ public class ToolRegistry {
             JsonNode value = entry.getValue(); Map<?,?> schema=(Map<?,?>)tool.propertySchemas().get(entry.getKey());
             if (value.isContainerNode()) throw new IllegalArgumentException();
             Object type=schema.get("type");
-            if (value.isNull()) { if (!(type instanceof List<?> types && types.contains("null"))) throw new IllegalArgumentException(); return; }
+            if (value.isNull()) { if (!(type instanceof List<?> types && types.contains("null"))) throw new IllegalArgumentException(); continue; }
             if (type instanceof String t && t.equals("string")) {
                 if (!value.isTextual()) throw new IllegalArgumentException(); String s=value.asText();
                 if (schema.get("minLength") instanceof Number n && s.length()<n.intValue()) throw new IllegalArgumentException();

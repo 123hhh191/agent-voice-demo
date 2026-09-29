@@ -1,5 +1,6 @@
 package com.example.agentvoice.voice;
 
+import com.example.agentvoice.common.ApiException;
 import com.example.agentvoice.common.TraceContext;
 import com.example.agentvoice.device.DeviceAuthService;
 import com.example.agentvoice.protocol.BoardAdapterRegistry;
@@ -15,6 +16,8 @@ import org.springframework.web.socket.CloseStatus;
 import org.springframework.web.socket.TextMessage;
 import org.springframework.web.socket.WebSocketSession;
 import org.springframework.web.socket.handler.AbstractWebSocketHandler;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 
 import java.nio.ByteBuffer;
 import java.time.Instant;
@@ -32,7 +35,8 @@ import org.springframework.scheduling.annotation.Scheduled;
 @org.springframework.context.annotation.Profile("!scaffold")
 /** Routes authenticated control events and binary frames using bounded per-turn audio state. */
 public class DeviceGateway extends AbstractWebSocketHandler {
-    private final ObjectMapper mapper;private final VoiceTurnService turns;private final ResumeService resumeService;private final DeviceAuthService auth;private final VoiceTurnCoordinator coordinator;private final BoardAdapterRegistry boardAdapters;private final CommandDispatcher commands;private final String boardModel;
+    private static final Logger log=LoggerFactory.getLogger(DeviceGateway.class);
+    private final ObjectMapper mapper;private final VoiceTurnService turns;private final ResumeService resumeService;private final DeviceAuthService auth;private final VoiceTurnCoordinator coordinator;private final VoicePlaybackService playback;private final BoardAdapterRegistry boardAdapters;private final CommandDispatcher commands;private final String boardModel;
     private final ConcurrentHashMap<String,TurnState> states=new ConcurrentHashMap<>();
     private final ConcurrentHashMap<String,WebSocketSession> deviceSockets=new ConcurrentHashMap<>();
     private final ConcurrentHashMap<String,String> sessionTurns=new ConcurrentHashMap<>();
@@ -45,20 +49,22 @@ public class DeviceGateway extends AbstractWebSocketHandler {
     private final AtomicInteger activeTurns=new AtomicInteger();private final int maxTurns,maxAudioBytes,reorderLimit;private final long gapWaitMs;
     private final Object[] deviceLocks=new Object[64];
 
-    public DeviceGateway(ObjectMapper mapper,VoiceTurnService turns,ResumeService resumeService,DeviceAuthService auth,VoiceTurnCoordinator coordinator,BoardAdapterRegistry boardAdapters,CommandDispatcher commands,
+    public DeviceGateway(ObjectMapper mapper,VoiceTurnService turns,ResumeService resumeService,DeviceAuthService auth,VoiceTurnCoordinator coordinator,VoicePlaybackService playback,BoardAdapterRegistry boardAdapters,CommandDispatcher commands,
             @Value("${app.voice.max-active-turns:64}") int maxTurns,@Value("${app.voice.max-audio-bytes:960000}") int maxAudioBytes,
             @Value("${app.voice.reorder-limit:64}") int reorderLimit,@Value("${app.voice.gap-wait-ms:1000}") long gapWaitMs,@Value("${app.voice.board-model:MODEL_A}") String boardModel){
-        this.mapper=mapper;this.turns=turns;this.resumeService=resumeService;this.auth=auth;this.coordinator=coordinator;this.boardAdapters=boardAdapters;this.commands=commands;this.boardModel=boardModel;this.maxTurns=maxTurns;this.maxAudioBytes=maxAudioBytes;this.reorderLimit=reorderLimit;this.gapWaitMs=gapWaitMs;
+        this.mapper=mapper;this.turns=turns;this.resumeService=resumeService;this.auth=auth;this.coordinator=coordinator;this.playback=playback;this.boardAdapters=boardAdapters;this.commands=commands;this.boardModel=boardModel;this.maxTurns=maxTurns;this.maxAudioBytes=maxAudioBytes;this.reorderLimit=reorderLimit;this.gapWaitMs=gapWaitMs;
         if(maxTurns<1||maxAudioBytes<640||reorderLimit<1||gapWaitMs<1)throw new IllegalArgumentException("voice limits must be positive and fit at least one PCM frame");
         java.util.Arrays.setAll(deviceLocks,i->new Object());
     }
 
     @Override protected void handleTextMessage(WebSocketSession session,TextMessage message)throws Exception{
         String device=(String)session.getAttributes().get("deviceId");
+        String turnId=sessionTurns.get(session.getId());
         try{
             if(!device.equals(auth.authenticate((String)session.getAttributes().get("deviceToken"))))throw new ProtocolError("DEVICE_AUTH_FAILED",false);
             JsonNode root=mapper.readTree(message.getPayload());if(root.path("version").asInt()!=1)throw new ProtocolError("UNSUPPORTED_VERSION",false);
             String type=root.path("type").asText("");JsonNode payload=root.path("payload");
+            String eventTurnId=payload.path("turnId").asText("");if(!eventTurnId.isBlank())turnId=eventTurnId;
             // Only explicit control events can create, resume, close, or acknowledge a turn.
             switch(type){
                 case "start" -> start(session,device,root,payload);
@@ -72,7 +78,8 @@ public class DeviceGateway extends AbstractWebSocketHandler {
             }
         }catch(ProtocolError ex){if("FORMAT_MISMATCH".equals(ex.code))failCurrent(session,device);sendError(session,ex.code,ex.retryable);if("DEVICE_AUTH_FAILED".equals(ex.code))session.close(CloseStatus.POLICY_VIOLATION);}
         catch(AudioFrameCodec.FrameException ex){failCurrent(session,device);sendError(session,ex.code(),false);}
-        catch(Exception ex){sendError(session,"VOICE_OPERATION_FAILED",true);}
+        catch(ApiException ex){sendError(session,ex.code(),isRetryable(ex));if("DEVICE_AUTH_FAILED".equals(ex.code()))session.close(CloseStatus.POLICY_VIOLATION);}
+        catch(Exception ex){String traceId=TraceContext.current();if(traceId==null||traceId.isBlank())traceId=UUID.randomUUID().toString();log.error("Voice WebSocket operation failed traceId={} deviceId={} turnId={}",traceId,device,turnId,ex);sendError(session,"VOICE_OPERATION_FAILED",false,traceId);}
     }
 
     private void start(WebSocketSession session,String device,JsonNode root,JsonNode payload)throws Exception{synchronized(lockFor(device)){startLocked(session,device,root,payload);}}
@@ -132,15 +139,30 @@ public class DeviceGateway extends AbstractWebSocketHandler {
         if(coordinator.state(device)==VoiceTurnCoordinator.State.DIALOGUE_PENDING){if(!turns.ownsTurn(device,turnId,state.ownerVersion()))throw new ProtocolError("STALE_OWNER",false);turns.persistFinal(device,turnId,state.ownerVersion(),coordinator.finalText(device,turnId));coordinator.deliverDialogue(device,turnId);if(coordinator.state(device)==VoiceTurnCoordinator.State.FAILED){turns.failFinal(device,turnId,state.ownerVersion());release(turnId);sendError(session,coordinator.failureCode(device),false);return;}}
         if(coordinator.state(device)!=VoiceTurnCoordinator.State.PLAYING||!state.claimDelivery())return;
         if(!turns.ownsTurn(device,turnId,state.ownerVersion()))throw new ProtocolError("STALE_OWNER",false);
-        String text=coordinator.finalText(device,turnId);if(text==null)throw new ProtocolError("ASR_FINAL_MISSING",true);
-        var command=coordinator.command(device,turnId);if(command==null)throw new ProtocolError("AUDIO_OUTPUT_FAILED",true);
+        String text=coordinator.finalText(device,turnId);if(text==null)throw new ProtocolError("ASR_FINAL_MISSING",false);
+        var command=coordinator.command(device,turnId);if(command==null)throw new ProtocolError("AUDIO_OUTPUT_FAILED",false);
         send(session,Map.of("version",1,"type","final","turnId",turnId,"text",text,"finalVersion",1,"asrAttemptId",state.attemptId().toString(),"command",command));
     }
 
     private void cancel(WebSocketSession session,String device,JsonNode payload)throws Exception{String id=payload.path("turnId").asText("");TurnState state=requireOwner(session,device,id);var stop=coordinator.cancel(device,id,state.attemptId().toString());turns.cancel(device,id,state.ownerVersion());release(id);var response=new java.util.LinkedHashMap<String,Object>();response.put("version",1);response.put("type","cancelled");response.put("turnId",id);if(stop!=null)response.put("command",stop);send(session,response);}
     private void acknowledgeFinal(WebSocketSession session,String device,JsonNode payload)throws Exception{String id=payload.path("turnId").asText("");long owner=owner(session,id);if(deviceSockets.get(device)!=session)throw new ProtocolError("STALE_OWNER",false);if(coordinator.state(device)==VoiceTurnCoordinator.State.PLAYING||commands.hasPendingPlayback(device,id))throw new ProtocolError("PLAYBACK_PENDING",false);turns.acknowledgeFinal(device,id,owner);release(id);send(session,Map.of("version",1,"type","acknowledged","turnId",id));}
     private void acknowledgeCommand(WebSocketSession session,String device,JsonNode payload)throws Exception{String id=payload.path("turnId").asText(""),commandId=payload.path("commandId").asText("");long owner=owner(session,id);if(deviceSockets.get(device)!=session)throw new ProtocolError("STALE_OWNER",false);if(coordinator.state(device)==VoiceTurnCoordinator.State.PLAYING)coordinator.commandAck(device,id,commandId);else if(!commands.acknowledge(device,id,commandId))throw new ProtocolError("COMMAND_EXPIRED",false);send(session,Map.of("version",1,"type","command_acknowledged","turnId",id,"commandId",commandId,"ownerVersion",owner));}
-    private void playbackFinished(WebSocketSession session,String device,JsonNode payload)throws Exception{String id=payload.path("turnId").asText(""),commandId=payload.path("commandId").asText("");long owner=owner(session,id);if(deviceSockets.get(device)!=session)throw new ProtocolError("STALE_OWNER",false);if(coordinator.state(device)==VoiceTurnCoordinator.State.PLAYING)coordinator.playbackFinished(device,id,commandId);else commands.playbackFinished(device,id,commandId);turns.acknowledgeFinal(device,id,owner);release(id);if(coordinator.reopenPolicy()==VoiceTurnCoordinator.ReopenPolicy.AUTO_LISTEN){startAutoListen(session,device,id);}else send(session,Map.of("version",1,"type","playback_acknowledged","turnId",id,"commandId",commandId));}
+    private void playbackFinished(WebSocketSession session,String device,JsonNode payload)throws Exception{
+        synchronized(lockFor(device)){
+            String id=payload.path("turnId").asText(""),commandId=payload.path("commandId").asText("");
+            long ownerVersion=owner(session,id);
+            if(deviceSockets.get(device)!=session)throw new ProtocolError("STALE_OWNER",false);
+            VoicePlaybackService.Completion completion=playback.complete(device,id,ownerVersion,commandId);
+            if(completion.result()==VoicePlaybackService.Result.REJECTED)throw new ProtocolError(completion.errorCode(),false);
+
+            commands.playbackCommitted(commandId);
+            VoiceTurnCoordinator.PlaybackResult memoryResult=coordinator.playbackFinished(device,id,commandId);
+            if(memoryResult==VoiceTurnCoordinator.PlaybackResult.REJECTED)log.warn("Committed playback receipt did not match local turn traceId={} deviceId={} turnId={}",TraceContext.current(),device,id);
+            release(id);
+            if(completion.result()==VoicePlaybackService.Result.APPLIED&&coordinator.reopenPolicy()==VoiceTurnCoordinator.ReopenPolicy.AUTO_LISTEN){startAutoListen(session,device,id);}
+            else send(session,Map.of("version",1,"type","playback_acknowledged","turnId",id,"commandId",commandId));
+        }
+    }
     private void startAutoListen(WebSocketSession session,String device,String previousTurn)throws Exception{
         var format=new VoiceTurnService.AudioFormat(1,16000,1,20);var turn=turns.start(device,"auto-"+previousTurn,format);
         try{reserveState(turn);}catch(RuntimeException ex){turns.cancel(device,turn.turnId(),turn.ownerVersion());throw ex;}
@@ -150,14 +172,16 @@ public class DeviceGateway extends AbstractWebSocketHandler {
             send(session,Map.of("version",1,"type","listening_started","turnId",turn.turnId(),"asrAttemptId",turn.attemptId(),"resumeToken",turn.resumeToken(),"ownerVersion",turn.ownerVersion(),"deadlineAt",turn.deadlineAt(),"command",command));
         }catch(Exception ex){turns.cancel(device,turn.turnId(),turn.ownerVersion());coordinator.cancel(device,turn.turnId(),turn.attemptId());release(turn.turnId());throw ex;}
     }
-    private TurnState requireOwner(WebSocketSession session,String device,String turnId){TurnState s=states.get(turnId);if(s==null)throw new ProtocolError("RESUME_EXPIRED",true);if(deviceSockets.get(device)!=session||!turns.ownsTurn(device,turnId,s.ownerVersion())||!turnId.equals(sessionTurns.get(session.getId()))||owner(session,turnId)!=s.ownerVersion())throw new ProtocolError("STALE_OWNER",false);return s;}
+    private TurnState requireOwner(WebSocketSession session,String device,String turnId){TurnState s=states.get(turnId);if(s==null)throw new ProtocolError("RESUME_EXPIRED",false);if(deviceSockets.get(device)!=session||!turns.ownsTurn(device,turnId,s.ownerVersion())||!turnId.equals(sessionTurns.get(session.getId()))||owner(session,turnId)!=s.ownerVersion())throw new ProtocolError("STALE_OWNER",false);return s;}
     private long owner(WebSocketSession s,String id){Long v=sessionOwners.get(s.getId());if(v==null||!id.equals(sessionTurns.get(s.getId())))throw new ProtocolError("TURN_REQUIRED",false);return v;}
     private void bind(WebSocketSession session,String device,String turn,long owner){WebSocketSession previous=deviceSockets.put(device,session);if(previous!=null&&previous!=session&&previous.isOpen())try{previous.close(CloseStatus.NORMAL.withReason("connection replaced"));}catch(Exception ignored){}sessionTurns.put(session.getId(),turn);sessionOwners.put(session.getId(),owner);}
     private void reserveState(VoiceTurnService.Turn turn){if(activeTurns.incrementAndGet()>maxTurns){activeTurns.decrementAndGet();throw new ProtocolError("VOICE_CAPACITY_EXCEEDED",true);}}
     private Object lockFor(String device){return deviceLocks[(device.hashCode()&0x7fffffff)%deviceLocks.length];}
     private void release(String turn){if(states.remove(turn)!=null)activeTurns.decrementAndGet();formats.remove(turn);turnDevices.remove(turn);deadlines.remove(turn);disconnectTimes.remove(turn);}
     private void sendAck(WebSocketSession s,String id,TurnState state)throws Exception{send(s,Map.of("version",1,"type","ack","turnId",id,"receivedThrough",state.receivedThrough(),"missingRanges",state.missingRanges()));}
-    private void sendError(WebSocketSession s,String code,boolean retryable){try{send(s,Map.of("version",1,"type","error","code",code,"retryable",retryable,"traceId",UUID.randomUUID().toString()));}catch(Exception ignored){}}
+    private boolean isRetryable(ApiException ex){return ex.status()==HttpStatus.TOO_MANY_REQUESTS||ex.status()==HttpStatus.SERVICE_UNAVAILABLE||ex.status()==HttpStatus.GATEWAY_TIMEOUT;}
+    private void sendError(WebSocketSession s,String code,boolean retryable){sendError(s,code,retryable,UUID.randomUUID().toString());}
+    private void sendError(WebSocketSession s,String code,boolean retryable,String traceId){try{send(s,Map.of("version",1,"type","error","code",code,"retryable",retryable,"traceId",traceId));}catch(Exception ignored){}}
     private void send(WebSocketSession s,Object event)throws Exception{if(s.isOpen())s.sendMessage(new TextMessage(mapper.writeValueAsString(event)));}
     @Override protected void handleBinaryMessage(WebSocketSession session,BinaryMessage message)throws Exception{try{binary(session,message);}catch(ProtocolError ex){if("FORMAT_MISMATCH".equals(ex.code))failCurrent(session,(String)session.getAttributes().get("deviceId"));sendError(session,ex.code,ex.retryable);}catch(AudioFrameCodec.FrameException ex){VoiceTurnCoordinator.State state=coordinator.state((String)session.getAttributes().get("deviceId"));if(state==VoiceTurnCoordinator.State.LISTENING||state==VoiceTurnCoordinator.State.SPEAKING)failCurrent(session,(String)session.getAttributes().get("deviceId"));sendError(session,ex.code(),false);}catch(RuntimeException ex){VoiceTurnCoordinator.State state=coordinator.state((String)session.getAttributes().get("deviceId"));if(state==VoiceTurnCoordinator.State.LISTENING||state==VoiceTurnCoordinator.State.SPEAKING)failCurrent(session,(String)session.getAttributes().get("deviceId"));sendError(session,"INVALID_AUDIO_EVENT",false);}}
     @Override public void afterConnectionEstablished(WebSocketSession session){}

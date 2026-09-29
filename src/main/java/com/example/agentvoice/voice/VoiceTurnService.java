@@ -34,15 +34,16 @@ public class VoiceTurnService {
     @Transactional
     public Turn start(String deviceId,String requestId,AudioFormat format){
         validateFormat(format);
-        var device=jdbc.query("SELECT active_turn_id FROM device_registry WHERE device_id=? AND enabled=TRUE FOR UPDATE",(rs,n)->rs.getString(1),deviceId);
+        var device=jdbc.query("SELECT active_turn_id,owner_version FROM device_registry WHERE device_id=? AND enabled=TRUE FOR UPDATE",(rs,n)->new DeviceStartRow(rs.getString(1),rs.getLong(2)),deviceId);
         if(device.isEmpty())throw error(HttpStatus.UNAUTHORIZED,"DEVICE_AUTH_FAILED","设备认证失败");
         var previous=jdbc.query("SELECT turn_id,state,format_json,attempt_id,resume_token_hash,owner_version,deadline_at,final_text,disconnected_at FROM voice_turn WHERE device_id=? AND start_request_id=?",(rs,n)->new TurnRow(rs.getString(1),rs.getString(2),rs.getString(3),rs.getString(4),rs.getString(5),rs.getLong(6),rs.getTimestamp(7).toInstant(),rs.getString(8),rs.getTimestamp(9)==null?null:rs.getTimestamp(9).toInstant()),deviceId,requestId);
-        if(!previous.isEmpty()){TurnRow row=previous.get(0);if(!row.formatJson().equals(write(format)))throw error(HttpStatus.CONFLICT,"REQUEST_ID_REUSED","clientRequestId 已用于不同音频格式");if("CANCELLED".equals(row.state())||"FAILED".equals(row.state()))throw error(HttpStatus.GONE,"TURN_TERMINAL","该请求对应轮次已结束，请使用新的 clientRequestId");if("RECORDING".equals(row.state())&&(Instant.now().isAfter(row.deadline())||(row.disconnectedAt()!=null&&Instant.now().isAfter(row.disconnectedAt().plus(RESUME_GRACE)))))throw error(HttpStatus.GONE,"RESUME_EXPIRED","轮次已超过恢复期限");if(device.get(0)!=null&&!row.turnId().equals(device.get(0)))throw error(HttpStatus.CONFLICT,"DEVICE_BUSY","设备已有其他活动轮次");return toTurn(deviceId,row);}
-        if(device.get(0)!=null)throw error(HttpStatus.CONFLICT,"DEVICE_BUSY","设备已有活动轮次");
+        if(!previous.isEmpty()){TurnRow row=previous.get(0);if(!row.formatJson().equals(write(format)))throw error(HttpStatus.CONFLICT,"REQUEST_ID_REUSED","clientRequestId 已用于不同音频格式");if("CANCELLED".equals(row.state())||"FAILED".equals(row.state()))throw error(HttpStatus.GONE,"TURN_TERMINAL","该请求对应轮次已结束，请使用新的 clientRequestId");if("RECORDING".equals(row.state())&&(Instant.now().isAfter(row.deadline())||(row.disconnectedAt()!=null&&Instant.now().isAfter(row.disconnectedAt().plus(RESUME_GRACE)))))throw error(HttpStatus.GONE,"RESUME_EXPIRED","轮次已超过恢复期限");if(device.get(0).activeTurnId()!=null&&!row.turnId().equals(device.get(0).activeTurnId()))throw error(HttpStatus.CONFLICT,"DEVICE_BUSY","设备已有其他活动轮次");return toTurn(deviceId,row);}
+        if(device.get(0).activeTurnId()!=null)throw error(HttpStatus.CONFLICT,"DEVICE_BUSY","设备已有活动轮次");
         UUID turn=UUID.randomUUID(),attempt=UUID.randomUUID();String resume=resumeToken(deviceId,turn.toString());Instant deadline=Instant.now().plus(MAX_TURN);
-        jdbc.update("INSERT INTO voice_turn(turn_id,device_id,start_request_id,state,format_json,attempt_id,resume_token_hash,deadline_at) VALUES(?,?,?,'RECORDING',?,?,?,?)",turn.toString(),deviceId,requestId,write(format),attempt.toString(),sha256(resume),Timestamp.from(deadline));
-        if(jdbc.update("UPDATE device_registry SET active_turn_id=?,owner_version=owner_version+1 WHERE device_id=? AND active_turn_id IS NULL",turn.toString(),deviceId)!=1)throw error(HttpStatus.CONFLICT,"DEVICE_BUSY","设备已有活动轮次");
-        return new Turn(turn.toString(),attempt.toString(),resume,1,deadline.toString(),"RECORDING",null,"CONTINUE");
+        long ownerVersion=device.get(0).ownerVersion()+1;
+        jdbc.update("INSERT INTO voice_turn(turn_id,device_id,start_request_id,state,format_json,attempt_id,resume_token_hash,owner_version,deadline_at) VALUES(?,?,?,'RECORDING',?,?,?,?,?)",turn.toString(),deviceId,requestId,write(format),attempt.toString(),sha256(resume),ownerVersion,Timestamp.from(deadline));
+        if(jdbc.update("UPDATE device_registry SET active_turn_id=?,owner_version=? WHERE device_id=? AND active_turn_id IS NULL AND owner_version=?",turn.toString(),ownerVersion,deviceId,device.get(0).ownerVersion())!=1)throw error(HttpStatus.CONFLICT,"DEVICE_BUSY","设备已有活动轮次");
+        return new Turn(turn.toString(),attempt.toString(),resume,ownerVersion,deadline.toString(),"RECORDING",null,"CONTINUE");
     }
 
     /** Rebinds a reconnecting socket; loss of node-local audio state always changes ASR attempt. */
@@ -105,6 +106,7 @@ public class VoiceTurnService {
     private String write(Object value){try{return mapper.writeValueAsString(value);}catch(Exception e){throw new IllegalStateException(e);}}
     private ApiException error(HttpStatus status,String code,String message){return new ApiException(status,code,message);}
     private record TurnRow(String turnId,String state,String formatJson,String attemptId,String tokenHash,long ownerVersion,Instant deadline,String finalText,Instant disconnectedAt){}
+    private record DeviceStartRow(String activeTurnId,long ownerVersion){}
     private record ResumeRow(String state,String formatJson,String attemptId,String tokenHash,long ownerVersion,Instant started,Instant deadline,String finalText,Instant disconnectedAt){}
     public record AudioFormat(int codec,int sampleRate,int channels,int frameDurationMs){}
     public record Turn(String turnId,String attemptId,String resumeToken,long ownerVersion,String deadlineAt,String state,String finalText,String resumeStrategy){}
