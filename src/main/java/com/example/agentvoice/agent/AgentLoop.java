@@ -5,6 +5,7 @@ import com.example.agentvoice.config.DeepSeekProperties;
 import com.example.agentvoice.execution.ToolInvocationService;
 import com.example.agentvoice.event.RunEventService;
 import com.example.agentvoice.llm.DeepSeekClient;
+import com.example.agentvoice.llm.DeepSeekApiKey;
 import com.example.agentvoice.llm.LlmDecision;
 import com.example.agentvoice.memory.ContextBuilder;
 import com.example.agentvoice.memory.ContextCompactor;
@@ -27,7 +28,8 @@ public class AgentLoop {
     private final DeepSeekClient llm; private final ToolRegistry tools; private final SessionService sessions;
     private final ContextBuilder context; private final ContextCompactor compactor; private final DeepSeekProperties properties; private final ObjectMapper mapper; private final ToolInvocationService invocations; private final RunEventService events;
     public AgentLoop(DeepSeekClient llm,ToolRegistry tools,SessionService sessions,ContextBuilder context,ContextCompactor compactor,DeepSeekProperties properties,ObjectMapper mapper,ToolInvocationService invocations,RunEventService events){this.llm=llm;this.tools=tools;this.sessions=sessions;this.context=context;this.compactor=compactor;this.properties=properties;this.mapper=mapper;this.invocations=invocations;this.events=events;}
-    public SessionService.Run run(String sessionId,String userId,String requestId,String text,String traceId){
+    public SessionService.Run run(String sessionId,String userId,String requestId,String text,String apiKey,String traceId){
+        apiKey=DeepSeekApiKey.requireValid(apiKey);
         SessionService.Run run=sessions.start(sessionId,userId,requestId,text,traceId);
         if(!"RUNNING".equals(run.status()))return run;
         recordEvent(run.runId(),"run.started",Map.of("runId",run.runId(),"status","RUNNING"));
@@ -39,13 +41,18 @@ public class AgentLoop {
                 if(Instant.now().isAfter(deadline))throw new ApiException(HttpStatus.GATEWAY_TIMEOUT,"RUN_DEADLINE","运行超时");
                 List<Map<String,Object>> definitions=tools.definitions();
                 List<Map<String,Object>> messages=context.build(sessionId);
+                if(context.estimateTokens(messages,definitions)>properties.contextSoftTokenBudget()){
+                    // An unsafe legacy summary may have been bypassed; rebuild from eligible facts first.
+                    compactor.compact(sessionId,apiKey);
+                    messages=context.build(sessionId);
+                }
                 if(context.estimateTokens(messages,definitions)>properties.contextSoftTokenBudget())throw new ApiException(HttpStatus.PAYLOAD_TOO_LARGE,"CONTEXT_TOO_LARGE","会话上下文超出预算");
-                LlmDecision decision=llm.decide(messages,definitions);
+                LlmDecision decision=llm.decide(apiKey,messages,definitions);
                 if(!decision.hasToolCalls()){
                     sessions.append(sessionId,run.runId(),"assistant",decision.content(),null,null);
                     sessions.complete(sessionId,run.runId(),decision.content(),decisions+1);
                     recordEvent(run.runId(),"run.completed",Map.of("runId",run.runId(),"status","SUCCEEDED"));
-                    try{compactor.compact(sessionId);}catch(RuntimeException ignored){/* 摘要失败保留完整原始消息。 */}
+                    try{compactor.compact(sessionId,apiKey);}catch(RuntimeException ignored){/* 摘要失败保留完整原始消息。 */}
                     return new SessionService.Run(run.runId(),"SUCCEEDED",decision.content(),null,traceId);
                 }
                 List<Map<String,Object>> stored=decision.toolCalls().stream().map(c->Map.<String,Object>of("id",c.id(),"type","function","function",Map.of("name",c.name(),"arguments",c.argumentsJson()))).toList();

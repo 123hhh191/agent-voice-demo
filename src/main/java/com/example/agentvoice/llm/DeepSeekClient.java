@@ -5,11 +5,13 @@ import com.example.agentvoice.config.DeepSeekProperties;
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import org.springframework.http.HttpStatus;
+import org.springframework.http.HttpHeaders;
 import org.springframework.http.MediaType;
 import org.springframework.http.client.SimpleClientHttpRequestFactory;
 import org.springframework.stereotype.Component;
 import org.springframework.web.client.RestClient;
 import org.springframework.web.client.RestClientException;
+import org.springframework.web.client.RestClientResponseException;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -30,34 +32,47 @@ public class DeepSeekClient {
         SimpleClientHttpRequestFactory factory = new SimpleClientHttpRequestFactory();
         factory.setConnectTimeout(properties.connectTimeout());
         factory.setReadTimeout(properties.readTimeout());
-        this.client = RestClient.builder().baseUrl(properties.baseUrl().toString()).requestFactory(factory)
-                .defaultHeader("Authorization", "Bearer " + properties.apiKey()).build();
+        this.client = RestClient.builder().baseUrl(properties.baseUrl().toString()).requestFactory(factory).build();
     }
 
-    public LlmDecision decide(List<Map<String, Object>> messages, List<Map<String, Object>> tools) {
+    public LlmDecision decide(String apiKey, List<Map<String, Object>> messages, List<Map<String, Object>> tools) {
         Map<String, Object> request = Map.of("model", properties.model(), "messages", messages, "tools", tools,
                 "tool_choice", "auto", "thinking", Map.of("type", "disabled"), "stream", false, "max_tokens", 4000);
         try {
-            JsonNode root = client.post().uri("/chat/completions").contentType(MediaType.APPLICATION_JSON)
+            JsonNode root = client.post().uri("/chat/completions").header(HttpHeaders.AUTHORIZATION, bearer(apiKey)).contentType(MediaType.APPLICATION_JSON)
                     .body(request).retrieve().body(JsonNode.class);
             return parse(root);
+        } catch (RestClientResponseException ex) {
+            throw modelError(ex, "模型服务调用失败");
         } catch (RestClientException ex) {
-            log.warn("DeepSeek request failed, traceId={}", com.example.agentvoice.common.TraceContext.current(), ex);
+            log.warn("DeepSeek request failed, traceId={} errorType={}", com.example.agentvoice.common.TraceContext.current(), ex.getClass().getSimpleName());
             throw new ApiException(HttpStatus.BAD_GATEWAY, "MODEL_UNAVAILABLE", "模型服务调用失败");
         }
     }
 
-    public String summarize(List<Map<String,Object>> messages) {
+    public String summarize(String apiKey, List<Map<String,Object>> messages) {
         Map<String,Object> request=Map.of("model",properties.model(),"messages",messages,"stream",false,
                 "thinking",Map.of("type","disabled"),"max_tokens",1200,"response_format",Map.of("type","json_object"));
         try {
-            JsonNode root=client.post().uri("/chat/completions").contentType(MediaType.APPLICATION_JSON).body(request).retrieve().body(JsonNode.class);
+            JsonNode root=client.post().uri("/chat/completions").header(HttpHeaders.AUTHORIZATION, bearer(apiKey)).contentType(MediaType.APPLICATION_JSON).body(request).retrieve().body(JsonNode.class);
             JsonNode choice=root==null?null:root.path("choices");
             if(choice==null||!choice.isArray()||choice.isEmpty())throw new IllegalStateException("empty summary response");
             String result=choice.get(0).path("message").path("content").asText("");
             if(result.isBlank())throw new IllegalStateException("empty summary");
             return result;
-        } catch(RestClientException ex){throw new ApiException(HttpStatus.BAD_GATEWAY,"MODEL_UNAVAILABLE","模型摘要调用失败");}
+        } catch (RestClientResponseException ex) { throw modelError(ex, "模型摘要调用失败"); }
+        catch(RestClientException ex){log.warn("DeepSeek summary request failed, traceId={} errorType={}",com.example.agentvoice.common.TraceContext.current(),ex.getClass().getSimpleName());throw new ApiException(HttpStatus.BAD_GATEWAY,"MODEL_UNAVAILABLE","模型摘要调用失败");}
+    }
+
+    private String bearer(String apiKey) {
+        return "Bearer " + DeepSeekApiKey.requireValid(apiKey);
+    }
+
+    private ApiException modelError(RestClientResponseException ex, String genericMessage) {
+        if (ex.getStatusCode().value() == 401 || ex.getStatusCode().value() == 403)
+            return new ApiException(HttpStatus.UNAUTHORIZED, "DEEPSEEK_API_KEY_INVALID", "DeepSeek API Key 无效或无权访问当前模型");
+        log.warn("DeepSeek upstream returned status={}, traceId={}", ex.getStatusCode().value(), com.example.agentvoice.common.TraceContext.current());
+        return new ApiException(HttpStatus.BAD_GATEWAY, "MODEL_UNAVAILABLE", genericMessage);
     }
 
     LlmDecision parse(JsonNode root) {

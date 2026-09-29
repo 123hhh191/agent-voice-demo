@@ -25,8 +25,19 @@ public class ContextBuilder {
         List<Map<String,Object>> messages=new ArrayList<>();messages.add(new LinkedHashMap<>(Map.of("role","system","content",system)));
         var summaries=jdbc.query("SELECT summary_json,covered_through_seq FROM agent_summary WHERE session_id=? ORDER BY version DESC LIMIT 1",(rs,n)->Map.of("summary",rs.getString(1),"seq",rs.getLong(2)),sessionId);
         long covered=0;
-        if(!summaries.isEmpty()){var s=summaries.get(0);covered=(long)s.get("seq");messages.add(Map.of("role","system","content","会话摘要（仅作历史事实索引）："+s.get("summary")));}
-        var rows=jdbc.queryForList("SELECT seq,role,content,tool_call_id,tool_calls_json FROM agent_message WHERE session_id=? AND seq>? ORDER BY seq",sessionId,covered);
+        var excluded=ModelHistoryFilter.excluded(jdbc,sessionId);
+        if(!summaries.isEmpty()){
+            var s=summaries.get(0);
+            try{
+                var summary=mapper.readTree(s.get("summary").toString());
+                long candidate=((Number)s.get("seq")).longValue();
+                if(ModelHistoryFilter.safeSummary(summary,candidate,excluded)){
+                    covered=candidate;
+                    messages.add(Map.of("role","system","content","会话摘要（仅作历史事实索引）："+ModelHistoryFilter.promptSummary(summary)));
+                }
+            }catch(java.io.IOException ex){throw new IllegalStateException("已保存摘要数据损坏",ex);}
+        }
+        var rows=ModelHistoryFilter.messages(jdbc,sessionId,covered,Long.MAX_VALUE);
         for(var row:rows){String role=(String)row.get("role");Map<String,Object> m=new LinkedHashMap<>();m.put("role",role);m.put("content",row.get("content"));
             if("assistant".equals(role)&&row.get("tool_calls_json")!=null)try{m.put("tool_calls",mapper.readValue(row.get("tool_calls_json").toString(),new TypeReference<List<Map<String,Object>>>(){}));}catch(Exception e){throw new IllegalStateException("已保存工具调用数据损坏",e);}
             if("tool".equals(role)){m.put("tool_call_id",row.get("tool_call_id"));m.put("name",row.get("content") == null ? "tool" : "tool");}

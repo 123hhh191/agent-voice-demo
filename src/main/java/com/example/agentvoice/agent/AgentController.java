@@ -5,6 +5,7 @@ import com.example.agentvoice.common.TraceContext;
 import com.example.agentvoice.common.UserIdentity;
 import com.example.agentvoice.config.DeepSeekProperties;
 import com.example.agentvoice.session.SessionService;
+import com.example.agentvoice.llm.DeepSeekApiKey;
 import jakarta.servlet.http.HttpServletRequest;
 import jakarta.validation.Valid;
 import jakarta.validation.constraints.Max;
@@ -31,10 +32,10 @@ public class AgentController {
     @PostMapping("/sessions")
     public Map<String,Object> create(Principal principal,HttpServletRequest request){String user=user(principal,request);return Map.of("sessionId",sessions.create(user));}
     @PostMapping("/sessions/{id}/messages")
-    public SessionService.Run send(@PathVariable String id,@Valid @RequestBody MessageRequest body,Principal principal,HttpServletRequest request){
-        String user=user(principal,request);
+    public SessionService.Run send(@PathVariable String id,@Valid @RequestBody MessageRequest body,@RequestHeader(value="X-DeepSeek-Api-Key",required=false) String apiKey,Principal principal,HttpServletRequest request){
+            String user=user(principal,request);
         if(body.text().length()>properties.maxInputChars())throw new ApiException(HttpStatus.BAD_REQUEST,"INPUT_TOO_LARGE","输入内容超出长度限制");
-        return agent.run(id,user,body.requestId(),body.text(),TraceContext.current());
+        return agent.run(id,user,body.requestId(),body.text(),DeepSeekApiKey.requireValid(apiKey),TraceContext.current());
     }
     @GetMapping("/runs/{runId}")
     public SessionService.Run run(@PathVariable String runId,Principal principal,HttpServletRequest request){return sessions.getRun(runId,user(principal,request));}
