@@ -26,6 +26,7 @@ public final class VoiceTurnCoordinator {
     private final AudioOutputAdapter output; private final CommandDispatcher commands; private final ReopenPolicy policy;
     private final Map<String,Turn> turns=new ConcurrentHashMap<>();
     private final Map<String,String> dialogueSessions=new ConcurrentHashMap<>();
+    private static final org.slf4j.Logger log=org.slf4j.LoggerFactory.getLogger(VoiceTurnCoordinator.class);
     public VoiceTurnCoordinator(java.util.List<AsrProviderAdapter> providers,DialogueClient dialogue,AudioOutputAdapter output,CommandDispatcher commands,
                                 @Value("${app.voice.asr-provider:MOCK_A}") String provider,
                                 @Value("${app.voice.reopen-policy:WAIT_WAKEUP}") ReopenPolicy policy) {
@@ -52,11 +53,23 @@ public final class VoiceTurnCoordinator {
     public synchronized State end(String deviceId,String turnId,String attemptId) { Turn t=require(deviceId,turnId,attemptId);if(t.state!=State.LISTENING&&t.state!=State.SPEAKING)return t.state;finalizeTurn(t,t.endpoint.end().orElse(EndpointDetector.Cause.NO_SPEECH));return t.state; }
     public synchronized State timeout(String deviceId,long elapsedMs) { Turn t=turns.get(deviceId);if(t==null||(t.state!=State.LISTENING&&t.state!=State.SPEAKING))return t==null?State.IDLE:t.state;t.endpoint.timeout(elapsedMs).ifPresent(cause->finalizeTurn(t,cause));return t.state; }
     /** Called only after the caller commits the final ASR text to voice_turn. */
-    public synchronized State deliverDialogue(String deviceId,String turnId){Turn t=turns.get(deviceId);if(t==null||!t.turnId.equals(turnId)||t.state!=State.DIALOGUE_PENDING)return t==null?State.IDLE:t.state;if(t.dialogueStarted)return t.state;t.dialogueStarted=true;
-        try{DialogueClient.DialogueReply reply=dialogue.submit(t.deviceId,dialogueSessions.get(t.deviceId),t.turnId,t.finalText);dialogueSessions.put(t.deviceId,reply.sessionId());var asset=output.synthesize(reply.text());t.commandId=UUID.randomUUID().toString();t.command=new DeviceCommand(t.commandId,t.deviceId,t.turnId,DeviceCommand.Type.PLAY_AUDIO,1,Instant.now().plusSeconds(30),Map.of("audioFormat",asset.format(),"audioStreamId",asset.streamId(),"audioBase64",java.util.Base64.getEncoder().encodeToString(asset.bytes()),"fixture",true));commands.persist(t.command);t.state=State.PLAYING;}
-        catch(RuntimeException ex){t.failureCode="DIALOGUE_OR_OUTPUT_FAILED";t.state=State.FAILED;}return t.state;
+    public State deliverDialogue(String deviceId,String turnId){
+        Turn t;
+        synchronized(this){t=turns.get(deviceId);if(t==null||!t.turnId.equals(turnId)||t.state!=State.DIALOGUE_PENDING)return t==null?State.IDLE:t.state;if(t.dialogueStarted)return t.state;t.dialogueStarted=true;}
+        try{
+            DialogueClient.DialogueReply reply=dialogue.submit(t.deviceId,dialogueSessions.get(t.deviceId),t.turnId,t.finalText);
+            var asset=output.synthesize(reply.text());
+            synchronized(this){
+                if(turns.get(deviceId)!=t||t.state!=State.DIALOGUE_PENDING)return state(deviceId);
+                dialogueSessions.put(t.deviceId,reply.sessionId());t.commandId=UUID.randomUUID().toString();t.command=new DeviceCommand(t.commandId,t.deviceId,t.turnId,DeviceCommand.Type.PLAY_AUDIO,1,Instant.now().plusSeconds(30),Map.of("audioFormat",asset.format(),"audioStreamId",asset.streamId(),"audioBase64",java.util.Base64.getEncoder().encodeToString(asset.bytes()),"fixture",true));commands.persist(t.command);t.state=State.PLAYING;
+            }
+        }catch(RuntimeException ex){synchronized(this){if(turns.get(deviceId)==t){t.failureCode="DIALOGUE_OR_OUTPUT_FAILED";t.state=State.FAILED;}}log.error("Voice dialogue/output failed deviceId={} turnId={}",deviceId,turnId,ex);}
+        return state(deviceId);
     }
-    public synchronized DeviceCommand cancel(String deviceId,String turnId,String attemptId) { Turn t=require(deviceId,turnId,attemptId);DeviceCommand stop=null;if(t.state==State.PLAYING){stop=new DeviceCommand(UUID.randomUUID().toString(),deviceId,turnId,DeviceCommand.Type.STOP_PLAYBACK,2,Instant.now().plusSeconds(10),Map.of("reason","turn_cancelled"));commands.persist(stop);}t.asr.cancel();t.asr.close();t.state=State.IDLE;return stop; }
+    public synchronized DeviceCommand cancel(String deviceId,String turnId,String attemptId) { Turn t=require(deviceId,turnId,attemptId);DeviceCommand stop=null;if(t.state==State.PLAYING){stop=new DeviceCommand(UUID.randomUUID().toString(),deviceId,turnId,DeviceCommand.Type.STOP_PLAYBACK,2,Instant.now().plusSeconds(10),Map.of("reason","turn_cancelled"));commands.persist(stop);}t.state=State.IDLE;turns.remove(deviceId,t);closeAsr(t,true);return stop; }
+    /** Removes only the specified attempt; a late worker must never discard its successor. */
+    public synchronized void discard(String deviceId,String turnId,String attemptId){Turn t=turns.get(deviceId);if(t!=null&&t.turnId.equals(turnId)&&t.attemptId.equals(attemptId)){turns.remove(deviceId,t);closeAsr(t,true);}}
+    public synchronized String endpointCause(String deviceId){Turn t=turns.get(deviceId);return t==null||t.cause==null?"UNKNOWN":t.cause.name();}
     public synchronized void commandAck(String deviceId,String turnId,String commandId) { Turn t=turns.get(deviceId);if(t==null||!t.turnId.equals(turnId)||t.state!=State.PLAYING||!t.commandId.equals(commandId))throw new IllegalArgumentException("stale command ACK");if(!commands.acknowledge(deviceId,turnId,commandId))throw new IllegalArgumentException("command expired or unknown"); }
     /** Clears only the matching in-memory turn after VoicePlaybackService has committed it. */
     public synchronized PlaybackResult playbackFinished(String deviceId,String turnId,String commandId) {
@@ -73,16 +86,27 @@ public final class VoiceTurnCoordinator {
     public synchronized boolean commandExpired(String deviceId){Turn t=turns.get(deviceId);return t==null||t.command==null||!t.command.deadline().isAfter(Instant.now());}
     private void finalizeTurn(Turn t,EndpointDetector.Cause cause) {
         if(t.finalized)return;t.finalized=true;
-        if(cause==EndpointDetector.Cause.NO_SPEECH){t.asr.cancel();t.asr.close();t.failureCode="NO_SPEECH";t.state=State.FAILED;return;}
+        t.cause=cause;
+        if(cause==EndpointDetector.Cause.NO_SPEECH){closeAsr(t,true);t.failureCode="NO_SPEECH";t.state=State.FAILED;return;}
         t.state=State.FINALIZING;
-        try {
-            for(AsrEvent e:t.asr.finishInput())applyAsr(t,e);
-            if(t.asrError!=null)throw new IllegalStateException("ASR failed: "+t.asrError);
-            if(t.finalText==null||t.finalText.isBlank())throw new IllegalStateException("ASR returned no final text");
-            t.state=State.DIALOGUE_PENDING;
-        } catch(RuntimeException ex){t.failureCode=t.asrError!=null?"ASR_FAILED":(t.state==State.DIALOGUE_PENDING?"DIALOGUE_OR_OUTPUT_FAILED":"VOICE_TURN_FAILED");t.state=State.FAILED;t.asr.cancel();}
-        finally {t.asr.close();}
     }
+    /** Blocking provider finalization is run by TaskWorker, outside the coordinator monitor. */
+    public State finishInput(String deviceId,String turnId,String attemptId) {
+        Turn t;
+        synchronized(this){t=require(deviceId,turnId,attemptId);if(t.state!=State.FINALIZING||t.finishStarted)return t.state;t.finishStarted=true;}
+        try {
+            var events=t.asr.finishInput();
+            synchronized(this){
+                if(turns.get(deviceId)!=t||t.state!=State.FINALIZING)return state(deviceId);
+                for(AsrEvent e:events)applyAsr(t,e);
+                if(t.asrError!=null||t.finalText==null||t.finalText.isBlank()){t.failureCode="ASR_FAILED";t.state=State.FAILED;}
+                else t.state=State.DIALOGUE_PENDING;
+            }
+        }catch(RuntimeException ex){synchronized(this){if(turns.get(deviceId)==t&&t.state==State.FINALIZING){t.failureCode="ASR_FAILED";t.state=State.FAILED;}}log.error("ASR finalization failed deviceId={} turnId={} attemptId={}",deviceId,turnId,attemptId,ex);}
+        finally{closeAsr(t,false);}
+        return state(deviceId);
+    }
+    private void closeAsr(Turn t,boolean cancel){if(t.closed.compareAndSet(false,true)){try{if(cancel)t.asr.cancel();}finally{t.asr.close();}}}
     private void applyAsr(Turn t,AsrEvent e) {
         if(!t.attemptId.equals(e.attemptId()))return;
         if(e.type()==AsrEvent.Type.ERROR){t.asrError=e.errorCode()==null?"ASR_ERROR":e.errorCode();return;}
@@ -93,7 +117,8 @@ public final class VoiceTurnCoordinator {
     private static final class Turn {
         final String deviceId,turnId,attemptId,fixture;final com.example.agentvoice.asr.AsrSession asr;final EndpointDetector endpoint=new EnergyVad(600,30_000,5_000,0.015);
         final Map<String,Long> revisions=new java.util.HashMap<>();final Map<String,String> partials=new java.util.HashMap<>(),finals=new java.util.TreeMap<>();
-        State state=State.LISTENING;String finalText,commandId,asrError,failureCode;DeviceCommand command;boolean finalized,dialogueStarted;
+        State state=State.LISTENING;String finalText,commandId,asrError,failureCode;DeviceCommand command;boolean finalized,dialogueStarted,finishStarted;EndpointDetector.Cause cause;
+        final java.util.concurrent.atomic.AtomicBoolean closed=new java.util.concurrent.atomic.AtomicBoolean();
         Turn(String d,String t,String a,String f,com.example.agentvoice.asr.AsrSession s){deviceId=d;turnId=t;attemptId=a;fixture=f;asr=s;}
     }
 }

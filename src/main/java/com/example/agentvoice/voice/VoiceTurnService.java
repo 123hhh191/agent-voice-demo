@@ -28,7 +28,16 @@ import java.util.UUID;
 public class VoiceTurnService {
     private static final Duration MAX_TURN=Duration.ofSeconds(30), RESUME_GRACE=Duration.ofSeconds(10);
     private final JdbcTemplate jdbc;private final ObjectMapper mapper;private final DeviceAuthService auth;private final SecureRandom random=new SecureRandom();
-    public VoiceTurnService(JdbcTemplate jdbc,ObjectMapper mapper,DeviceAuthService auth){this.jdbc=jdbc;this.mapper=mapper;this.auth=auth;}
+    private final java.time.Clock clock; private final long finalizationTimeoutMs;
+    public VoiceTurnService(JdbcTemplate jdbc,ObjectMapper mapper,DeviceAuthService auth){this(jdbc,mapper,auth,10_000,java.time.Clock.systemUTC());}
+    @org.springframework.beans.factory.annotation.Autowired
+    public VoiceTurnService(JdbcTemplate jdbc,ObjectMapper mapper,DeviceAuthService auth,
+            @org.springframework.beans.factory.annotation.Value("${app.voice.finalization-timeout-ms:10000}") long timeoutMs){this(jdbc,mapper,auth,timeoutMs,java.time.Clock.systemUTC());}
+    VoiceTurnService(JdbcTemplate jdbc,ObjectMapper mapper,DeviceAuthService auth,long timeoutMs,java.time.Clock clock){
+        if(timeoutMs<=0)throw new IllegalArgumentException("finalization timeout must be positive");
+        this.jdbc=jdbc;this.mapper=mapper;this.auth=auth;this.finalizationTimeoutMs=timeoutMs;this.clock=clock;
+    }
+    public long finalizationTimeoutMs(){return finalizationTimeoutMs;}
 
     /** Creates an idempotent turn and atomically enforces one active turn per device. */
     @Transactional
@@ -75,11 +84,27 @@ public class VoiceTurnService {
         return new Turn(turnId,attempt,resumeToken(deviceId,turnId),owner,((Instant)r[2]).toString(),"RECORDING",null,"REQUIRE_FULL_REPLAY");
     }
 
+    /** One winner owns ASR finishInput; the recording deadline does not prohibit this transition. */
+    @Transactional
+    public boolean beginFinalization(String deviceId,String turnId,String attemptId,long ownerVersion){
+        if(!lockDeviceTurn(deviceId,turnId))throw error(HttpStatus.CONFLICT,"STALE_OWNER","轮次归属已失效");
+        int changed=jdbc.update("UPDATE voice_turn v JOIN device_registry d ON d.device_id=v.device_id SET v.state='PROCESSING',v.processing_deadline_at=? WHERE v.turn_id=? AND v.device_id=? AND v.attempt_id=? AND v.owner_version=? AND d.owner_version=? AND d.active_turn_id=v.turn_id AND v.state='RECORDING'",Timestamp.from(clock.instant().plusMillis(finalizationTimeoutMs)),turnId,deviceId,attemptId,ownerVersion,ownerVersion);
+        if(changed==1)return true;
+        if(!ownsProcessing(deviceId,turnId,attemptId,ownerVersion))throw error(HttpStatus.CONFLICT,"STALE_OWNER","收尾归属已失效");
+        return false;
+    }
+
     @Transactional
     public Turn persistFinal(String deviceId,String turnId,long ownerVersion,String finalText){
+        String attempt=jdbc.queryForObject("SELECT attempt_id FROM voice_turn WHERE turn_id=? AND device_id=?",String.class,turnId,deviceId);
+        return persistFinal(deviceId,turnId,attempt,ownerVersion,finalText);
+    }
+    @Transactional
+    public Turn persistFinal(String deviceId,String turnId,String attemptId,long ownerVersion,String finalText){
         if(!lockDeviceTurn(deviceId,turnId))throw error(HttpStatus.CONFLICT,"STALE_OWNER","设备或轮次归属已失效");
-        int changed=jdbc.update("UPDATE voice_turn SET state='FINAL',final_text=?,final_version=final_version+1,completed_at=CURRENT_TIMESTAMP(6) WHERE turn_id=? AND device_id=? AND owner_version=? AND state IN ('RECORDING','PROCESSING') AND deadline_at>=CURRENT_TIMESTAMP(6)",finalText,turnId,deviceId,ownerVersion);
-        if(changed==0){var saved=jdbc.query("SELECT state,final_text,attempt_id,deadline_at FROM voice_turn WHERE turn_id=? AND device_id=?",(rs,n)->new Object[]{rs.getString(1),rs.getString(2),rs.getString(3),rs.getTimestamp(4).toInstant()},turnId,deviceId);if(!saved.isEmpty()&&"FINAL".equals(saved.get(0)[0]))return new Turn(turnId,(String)saved.get(0)[2],null,ownerVersion,((Instant)saved.get(0)[3]).toString(),"FINAL",(String)saved.get(0)[1],"RETURN_FINAL");throw error(HttpStatus.CONFLICT,"STALE_OWNER","该连接已失去轮次归属");}
+        if(finalText==null||finalText.isBlank())throw error(HttpStatus.BAD_REQUEST,"ASR_FINAL_MISSING","最终识别文本为空");
+        int changed=jdbc.update("UPDATE voice_turn v JOIN device_registry d ON d.device_id=v.device_id SET v.state='FINAL',v.final_text=?,v.final_version=v.final_version+1,v.completed_at=CURRENT_TIMESTAMP(6) WHERE v.turn_id=? AND v.device_id=? AND v.attempt_id=? AND v.owner_version=? AND d.owner_version=? AND d.active_turn_id=v.turn_id AND v.state='PROCESSING' AND v.processing_deadline_at>CURRENT_TIMESTAMP(6)",finalText,turnId,deviceId,attemptId,ownerVersion,ownerVersion);
+        if(changed==0){var saved=jdbc.query("SELECT v.final_text,v.deadline_at FROM voice_turn v JOIN device_registry d ON d.device_id=v.device_id WHERE v.turn_id=? AND v.device_id=? AND v.attempt_id=? AND v.owner_version=? AND d.owner_version=? AND d.active_turn_id=v.turn_id AND v.state='FINAL'",(rs,n)->new Object[]{rs.getString(1),rs.getTimestamp(2).toInstant()},turnId,deviceId,attemptId,ownerVersion,ownerVersion);if(!saved.isEmpty())return new Turn(turnId,attemptId,null,ownerVersion,((Instant)saved.get(0)[1]).toString(),"FINAL",(String)saved.get(0)[0],"RETURN_FINAL");throw error(HttpStatus.CONFLICT,"STALE_OWNER","最终结果已过期或归属失效");}
         var info=jdbc.queryForMap("SELECT attempt_id,deadline_at FROM voice_turn WHERE turn_id=?",turnId);
         return new Turn(turnId,info.get("attempt_id").toString(),null,ownerVersion,((Timestamp)info.get("deadline_at")).toInstant().toString(),"FINAL",finalText,"FINAL_SAVED");
     }
@@ -91,10 +116,13 @@ public class VoiceTurnService {
     @Transactional public boolean markDisconnected(String deviceId,String turnId,long ownerVersion){return jdbc.update("UPDATE voice_turn SET disconnected_at=COALESCE(disconnected_at,CURRENT_TIMESTAMP(6)) WHERE turn_id=? AND device_id=? AND owner_version=? AND state='RECORDING'",turnId,deviceId,ownerVersion)==1;}
     @Scheduled(fixedDelayString="${app.voice.cleanup-interval-ms:5000}")
     @Transactional public void expireUnavailableTurns(){
-        var expired=jdbc.query("SELECT turn_id,device_id FROM voice_turn WHERE state='RECORDING' AND ((deadline_at<CURRENT_TIMESTAMP(6)-INTERVAL 10 SECOND) OR (disconnected_at<CURRENT_TIMESTAMP(6)-INTERVAL 10 SECOND))",(rs,n)->new String[]{rs.getString(1),rs.getString(2)});
-        for(String[] item:expired){String turnId=item[0],deviceId=item[1];if(!lockDeviceTurn(deviceId,turnId))continue;int changed=jdbc.update("UPDATE voice_turn SET state='FAILED',completed_at=CURRENT_TIMESTAMP(6) WHERE turn_id=? AND device_id=? AND state='RECORDING' AND (deadline_at<CURRENT_TIMESTAMP(6)-INTERVAL 10 SECOND OR disconnected_at<CURRENT_TIMESTAMP(6)-INTERVAL 10 SECOND)",turnId,deviceId);if(changed==1)jdbc.update("UPDATE device_registry SET active_turn_id=NULL WHERE device_id=? AND active_turn_id=?",deviceId,turnId);}
+        String expiry="((state='RECORDING' AND (deadline_at<CURRENT_TIMESTAMP(6)-INTERVAL 10 SECOND OR disconnected_at<CURRENT_TIMESTAMP(6)-INTERVAL 10 SECOND)) OR (state='PROCESSING' AND processing_deadline_at<=CURRENT_TIMESTAMP(6)))";
+        var expired=jdbc.query("SELECT turn_id,device_id FROM voice_turn WHERE "+expiry,(rs,n)->new String[]{rs.getString(1),rs.getString(2)});
+        for(String[] item:expired){String turnId=item[0],deviceId=item[1];if(!lockDeviceTurn(deviceId,turnId))continue;int changed=jdbc.update("UPDATE voice_turn SET state='FAILED',completed_at=CURRENT_TIMESTAMP(6) WHERE turn_id=? AND device_id=? AND "+expiry,turnId,deviceId);if(changed==1)jdbc.update("UPDATE device_registry SET active_turn_id=NULL WHERE device_id=? AND active_turn_id=?",deviceId,turnId);}
     }
-    public boolean ownsTurn(String deviceId,String turnId,long ownerVersion){return !jdbc.queryForList("SELECT v.turn_id FROM voice_turn v JOIN device_registry d ON d.device_id=v.device_id AND d.active_turn_id=v.turn_id WHERE v.turn_id=? AND v.device_id=? AND v.owner_version=? AND ((v.state IN ('RECORDING','PROCESSING') AND v.deadline_at>CURRENT_TIMESTAMP(6)) OR v.state='FINAL') AND d.enabled=TRUE",turnId,deviceId,ownerVersion).isEmpty();}
+    public boolean ownsTurn(String deviceId,String turnId,long ownerVersion){return !jdbc.queryForList("SELECT v.turn_id FROM voice_turn v JOIN device_registry d ON d.device_id=v.device_id AND d.active_turn_id=v.turn_id WHERE v.turn_id=? AND v.device_id=? AND v.owner_version=? AND d.owner_version=? AND v.state IN ('RECORDING','PROCESSING','FINAL') AND d.enabled=TRUE",turnId,deviceId,ownerVersion,ownerVersion).isEmpty();}
+    public boolean ownsRecording(String deviceId,String turnId,String attemptId,long ownerVersion){return !jdbc.queryForList("SELECT v.turn_id FROM voice_turn v JOIN device_registry d ON d.active_turn_id=v.turn_id AND d.device_id=v.device_id WHERE v.device_id=? AND v.turn_id=? AND v.attempt_id=? AND v.owner_version=? AND d.owner_version=? AND d.enabled=TRUE AND v.state='RECORDING' AND v.deadline_at>CURRENT_TIMESTAMP(6)",deviceId,turnId,attemptId,ownerVersion,ownerVersion).isEmpty();}
+    public boolean ownsProcessing(String deviceId,String turnId,String attemptId,long ownerVersion){return !jdbc.queryForList("SELECT v.turn_id FROM voice_turn v JOIN device_registry d ON d.active_turn_id=v.turn_id AND d.device_id=v.device_id WHERE v.device_id=? AND v.turn_id=? AND v.attempt_id=? AND v.owner_version=? AND d.owner_version=? AND d.enabled=TRUE AND v.state='PROCESSING' AND v.processing_deadline_at>CURRENT_TIMESTAMP(6)",deviceId,turnId,attemptId,ownerVersion,ownerVersion).isEmpty();}
 
     private Turn toTurn(String deviceId,TurnRow row){String resume=resumeToken(deviceId,row.turnId());return new Turn(row.turnId(),row.attemptId(),resume,row.ownerVersion(),row.deadline().toString(),row.state(),row.finalText(),"IDEMPOTENT_REPLAY");}
     private boolean lockDeviceTurn(String deviceId,String turnId){var rows=jdbc.query("SELECT active_turn_id FROM device_registry WHERE device_id=? AND enabled=TRUE FOR UPDATE",(rs,n)->rs.getString(1),deviceId);return !rows.isEmpty()&&turnId.equals(rows.get(0));}

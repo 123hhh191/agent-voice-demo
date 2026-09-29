@@ -19,5 +19,7 @@ public class TaskWorker {
         }, new ThreadPoolExecutor.AbortPolicy());
     }
     public void submit(Runnable task) { executor.execute(task); }
+    /** Allows voice timeout/cancellation to interrupt a queued or running finishInput. */
+    public java.util.concurrent.Future<?> submitCancellable(Runnable task) { return executor.submit(task); }
     @PreDestroy public void close() { executor.shutdown(); }
 }
