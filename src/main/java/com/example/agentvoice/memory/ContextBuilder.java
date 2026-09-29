@@ -19,6 +19,7 @@ import java.util.Map;
 public class ContextBuilder {
     private final JdbcTemplate jdbc; private final ObjectMapper mapper; private final DeepSeekProperties properties;
     public ContextBuilder(JdbcTemplate jdbc,ObjectMapper mapper,DeepSeekProperties properties){this.jdbc=jdbc;this.mapper=mapper;this.properties=properties;}
+    /** 按摘要覆盖范围和消息资格组装模型上下文。 */
     public List<Map<String,Object>> build(String sessionId){
         String system;
         try{system=new ClassPathResource("prompts/agent-system.md").getContentAsString(StandardCharsets.UTF_8);}catch(Exception ex){throw new IllegalStateException("Agent prompt missing",ex);}
@@ -31,6 +32,7 @@ public class ContextBuilder {
             try{
                 var summary=mapper.readTree(s.get("summary").toString());
                 long candidate=((Number)s.get("seq")).longValue();
+                // 摘要若遗漏了被排除的凭据失败记录，就不能覆盖原始历史。
                 if(ModelHistoryFilter.safeSummary(summary,candidate,excluded)){
                     covered=candidate;
                     messages.add(Map.of("role","system","content","会话摘要（仅作历史事实索引）："+ModelHistoryFilter.promptSummary(summary)));
@@ -45,6 +47,7 @@ public class ContextBuilder {
         }
         return messages;
     }
+    /** 用序列化字符数保守估算上下文大小，避免中文内容被低估。 */
     public int estimateTokens(List<Map<String,Object>> messages,List<Map<String,Object>> tools){
         try {
             // Without the provider tokenizer, count each UTF-16 unit as one token to avoid undercounting Chinese text.

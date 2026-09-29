@@ -11,6 +11,7 @@ import java.security.Principal;
 public class UserIdentity {
     private final boolean demoAuth;
     public UserIdentity(@Value("${app.demo-auth.enabled:false}") boolean demoAuth) { this.demoAuth=demoAuth; }
+    /** 从登录主体或本地演示请求头解析用户标识。 */
     public String user(HttpServletRequest request) {
         Principal principal=request.getUserPrincipal();
         if(principal!=null&&!principal.getName().isBlank()&&principal.getName().length()<=128)return principal.getName();

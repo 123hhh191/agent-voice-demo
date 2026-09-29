@@ -2,6 +2,7 @@ package com.example.agentvoice.common;
 
 import org.springframework.http.HttpStatus;
 
+/** 携带 HTTP 状态和稳定错误码的业务异常。 */
 public class ApiException extends RuntimeException {
     private final HttpStatus status;
     private final String code;

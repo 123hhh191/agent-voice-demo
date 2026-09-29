@@ -61,6 +61,7 @@ public class DeviceGateway extends AbstractWebSocketHandler {
         java.util.Arrays.setAll(deviceLocks,i->new Object());
     }
 
+    /** 解析设备控制消息并分发到对应的轮次操作。 */
     @Override protected void handleTextMessage(WebSocketSession session,TextMessage message)throws Exception{
         String device=(String)session.getAttributes().get("deviceId");
         String turnId=sessionTurns.get(session.getId());
@@ -86,7 +87,9 @@ public class DeviceGateway extends AbstractWebSocketHandler {
         catch(Exception ex){String traceId=TraceContext.current();if(traceId==null||traceId.isBlank())traceId=UUID.randomUUID().toString();log.error("Voice WebSocket operation failed traceId={} deviceId={} turnId={}",traceId,device,turnId,ex);sendError(session,"VOICE_OPERATION_FAILED",false,traceId);}
     }
 
+    /** 创建持久化轮次、预留节点容量并通知设备开始录音。 */
     private void start(WebSocketSession session,String device,JsonNode root,JsonNode payload)throws Exception{synchronized(lockFor(device)){startLocked(session,device,root,payload);}}
+    /** 在设备锁内创建或幂等复用轮次，再绑定连接状态。 */
     private void startLocked(WebSocketSession session,String device,JsonNode root,JsonNode payload)throws Exception{
         String requestId=root.path("clientRequestId").asText("");if(!requestId.matches("[A-Za-z0-9._:-]{1,128}"))throw new ProtocolError("INVALID_REQUEST",false);
         var format=mapper.treeToValue(payload.path("format"),VoiceTurnService.AudioFormat.class);
@@ -100,7 +103,9 @@ public class DeviceGateway extends AbstractWebSocketHandler {
         send(session,Map.of("version",1,"type","started","turnId",turn.turnId(),"asrAttemptId",turn.attemptId(),"resumeToken",turn.resumeToken(),"ownerVersion",turn.ownerVersion(),"deadlineAt",turn.deadlineAt(),"resumeStrategy",turn.resumeStrategy()));
     }
 
+    /** 校验恢复凭据并接管断线轮次，必要时要求全量重放。 */
     private void resume(WebSocketSession session,String device,JsonNode payload)throws Exception{synchronized(lockFor(device)){resumeLocked(session,device,payload);}}
+    /** 在设备锁内验证恢复并同步内存状态与数据库所有权。 */
     private void resumeLocked(WebSocketSession session,String device,JsonNode payload)throws Exception{
         String turnId=payload.path("turnId").asText(""),token=payload.path("resumeToken").asText("");
         if(token.length()<40||token.length()>128)throw new ProtocolError("RESUME_EXPIRED",false);
@@ -127,7 +132,9 @@ public class DeviceGateway extends AbstractWebSocketHandler {
         },gapWaitMs,TimeUnit.MILLISECONDS);
     }
 
+    /** 解码协议帧、校验轮次归属并按序交给语音协调器。 */
     private void binary(WebSocketSession session,BinaryMessage message)throws Exception{synchronized(lockFor((String)session.getAttributes().get("deviceId"))){binaryLocked(session,message);}}
+    /** 在设备锁内解码、排序并处理连续到达的音频帧。 */
     private void binaryLocked(WebSocketSession session,BinaryMessage message)throws Exception{
         String turnId=sessionTurns.get(session.getId()),device=(String)session.getAttributes().get("deviceId");if(turnId==null)throw new ProtocolError("TURN_REQUIRED",false);
         TurnState state=requireOwner(session,device,turnId);
@@ -149,6 +156,7 @@ public class DeviceGateway extends AbstractWebSocketHandler {
         advance(device,state);
     }
     /** Timer threads only claim/schedule transitions; blocking finishInput runs on TaskWorker. */
+    /** 推进静音端点或硬截止，并安排非阻塞 ASR 收尾任务。 */
     private void advance(String device,TurnState state){synchronized(lockFor(device)){
         String id=state.turnId().toString();if(states.get(id)!=state)return;
         try{
@@ -190,6 +198,7 @@ public class DeviceGateway extends AbstractWebSocketHandler {
         String trace=traceId();log.warn("Voice turn failed traceId={} deviceId={} turnId={} code={} deadlineType={}",trace,device,id,code,"ASR_FINAL_TIMEOUT".equals(code)?"PROCESSING":"NONE");
         WebSocketSession socket=deviceSockets.get(device);if(socket!=null)sendError(socket,code,"ASR_BUSY".equals(code)||"MISSING_FRAMES".equals(code),trace);
     }}
+    /** 持久化最终识别结果、提交对话并向设备发送播报命令。 */
     private void deliverFinal(WebSocketSession session,String device,TurnState state)throws Exception{
         String turnId=state.turnId().toString();
         if(coordinator.state(device)==VoiceTurnCoordinator.State.FAILED){failTurn(device,state,coordinator.failureCode(device));return;}
@@ -207,9 +216,12 @@ public class DeviceGateway extends AbstractWebSocketHandler {
         if(session!=null&&session.isOpen())send(session,Map.of("version",1,"type","final","turnId",turnId,"text",text,"finalVersion",1,"asrAttemptId",state.attemptId().toString(),"command",command));
     }
 
+    /** 校验轮次所有权后取消录音或播报并释放节点状态。 */
     private void cancel(WebSocketSession session,String device,JsonNode payload)throws Exception{synchronized(lockFor(device)){String id=payload.path("turnId").asText("");TurnState state=requireOwner(session,device,id);turns.cancel(device,id,state.ownerVersion());var stop=coordinator.cancel(device,id,state.attemptId().toString());release(id);var response=new java.util.LinkedHashMap<String,Object>();response.put("version",1);response.put("type","cancelled");response.put("turnId",id);if(stop!=null)response.put("command",stop);send(session,response);}}
     private void acknowledgeFinal(WebSocketSession session,String device,JsonNode payload)throws Exception{String id=payload.path("turnId").asText("");long owner=owner(session,id);if(deviceSockets.get(device)!=session)throw new ProtocolError("STALE_OWNER",false);if(coordinator.state(device)==VoiceTurnCoordinator.State.PLAYING||commands.hasPendingPlayback(device,id))throw new ProtocolError("PLAYBACK_PENDING",false);turns.acknowledgeFinal(device,id,owner);release(id);send(session,Map.of("version",1,"type","acknowledged","turnId",id));}
+    /** 校验并确认设备收到的命令。 */
     private void acknowledgeCommand(WebSocketSession session,String device,JsonNode payload)throws Exception{String id=payload.path("turnId").asText(""),commandId=payload.path("commandId").asText("");long owner=owner(session,id);if(deviceSockets.get(device)!=session)throw new ProtocolError("STALE_OWNER",false);if(coordinator.state(device)==VoiceTurnCoordinator.State.PLAYING)coordinator.commandAck(device,id,commandId);else if(!commands.acknowledge(device,id,commandId))throw new ProtocolError("COMMAND_EXPIRED",false);send(session,Map.of("version",1,"type","command_acknowledged","turnId",id,"commandId",commandId,"ownerVersion",owner));}
+    /** 提交播放完成回执后释放轮次，并按策略决定是否自动续听。 */
     private void playbackFinished(WebSocketSession session,String device,JsonNode payload)throws Exception{
         synchronized(lockFor(device)){
             String id=payload.path("turnId").asText(""),commandId=payload.path("commandId").asText("");
@@ -236,11 +248,14 @@ public class DeviceGateway extends AbstractWebSocketHandler {
             send(session,Map.of("version",1,"type","listening_started","turnId",turn.turnId(),"asrAttemptId",turn.attemptId(),"resumeToken",turn.resumeToken(),"ownerVersion",turn.ownerVersion(),"deadlineAt",turn.deadlineAt(),"command",command));
         }catch(Exception ex){turns.cancel(device,turn.turnId(),turn.ownerVersion());coordinator.cancel(device,turn.turnId(),turn.attemptId());release(turn.turnId());throw ex;}
     }
+    /** 校验 WebSocket、设备、轮次和 ownerVersion 均匹配当前所有权。 */
     private TurnState requireOwner(WebSocketSession session,String device,String turnId){TurnState s=states.get(turnId);if(s==null)throw new ProtocolError("RESUME_EXPIRED",false);if(deviceSockets.get(device)!=session||!turns.ownsTurn(device,turnId,s.ownerVersion())||!turnId.equals(sessionTurns.get(session.getId()))||owner(session,turnId)!=s.ownerVersion())throw new ProtocolError("STALE_OWNER",false);return s;}
     private long owner(WebSocketSession s,String id){Long v=sessionOwners.get(s.getId());if(v==null||!id.equals(sessionTurns.get(s.getId())))throw new ProtocolError("TURN_REQUIRED",false);return v;}
+    /** 绑定当前设备连接并关闭旧连接，防止两个连接同时操作轮次。 */
     private void bind(WebSocketSession session,String device,String turn,long owner){WebSocketSession previous=deviceSockets.put(device,session);if(previous!=null&&previous!=session&&previous.isOpen())try{previous.close(CloseStatus.NORMAL.withReason("connection replaced"));}catch(Exception ignored){}sessionTurns.put(session.getId(),turn);sessionOwners.put(session.getId(),owner);}
     private void reserveState(VoiceTurnService.Turn turn){if(activeTurns.incrementAndGet()>maxTurns){activeTurns.decrementAndGet();throw new ProtocolError("VOICE_CAPACITY_EXCEEDED",true);}}
     private Object lockFor(String device){return deviceLocks[(device.hashCode()&0x7fffffff)%deviceLocks.length];}
+    /** 清理轮次缓存、计时器和收尾任务，并释放并发配额。 */
     private void release(String turn){if(states.remove(turn)!=null)activeTurns.decrementAndGet();formats.remove(turn);turnDevices.remove(turn);deadlines.remove(turn);disconnectTimes.remove(turn);cancelRecordingTimers(turn);var job=finalizations.remove(turn);if(job!=null){if(job.timeout!=null)job.timeout.cancel(false);if(job.work!=null&&job.runningThread!=Thread.currentThread())job.work.cancel(true);}}
     private void sendAck(WebSocketSession s,String id,TurnState state)throws Exception{send(s,Map.of("version",1,"type","ack","turnId",id,"receivedThrough",state.receivedThrough(),"missingRanges",state.missingRanges()));}
     private boolean isRetryable(ApiException ex){return ex.status()==HttpStatus.TOO_MANY_REQUESTS||ex.status()==HttpStatus.SERVICE_UNAVAILABLE||ex.status()==HttpStatus.GATEWAY_TIMEOUT;}
@@ -248,9 +263,12 @@ public class DeviceGateway extends AbstractWebSocketHandler {
     private void sendError(WebSocketSession s,String code,boolean retryable){sendError(s,code,retryable,UUID.randomUUID().toString());}
     private void sendError(WebSocketSession s,String code,boolean retryable,String traceId){try{send(s,Map.of("version",1,"type","error","code",code,"retryable",retryable,"traceId",traceId));}catch(Exception ex){log.warn("Voice error delivery failed traceId={} code={}",traceId,code,ex);}}
     private void send(WebSocketSession s,Object event)throws Exception{synchronized(s){if(s.isOpen())s.sendMessage(new TextMessage(mapper.writeValueAsString(event)));}}
+    /** 处理二进制音频并把协议错误转换为设备错误消息。 */
     @Override protected void handleBinaryMessage(WebSocketSession session,BinaryMessage message)throws Exception{try{binary(session,message);}catch(ProtocolError ex){if("FORMAT_MISMATCH".equals(ex.code))failCurrent(session,(String)session.getAttributes().get("deviceId"));sendError(session,ex.code,ex.retryable);}catch(AudioFrameCodec.FrameException ex){VoiceTurnCoordinator.State state=coordinator.state((String)session.getAttributes().get("deviceId"));if(state==VoiceTurnCoordinator.State.LISTENING||state==VoiceTurnCoordinator.State.SPEAKING)failCurrent(session,(String)session.getAttributes().get("deviceId"));sendError(session,ex.code(),false);}catch(RuntimeException ex){VoiceTurnCoordinator.State state=coordinator.state((String)session.getAttributes().get("deviceId"));if(state==VoiceTurnCoordinator.State.LISTENING||state==VoiceTurnCoordinator.State.SPEAKING)failCurrent(session,(String)session.getAttributes().get("deviceId"));sendError(session,"INVALID_AUDIO_EVENT",false);}}
     @Override public void afterConnectionEstablished(WebSocketSession session){}
+    /** 记录断连时间供恢复宽限期判断，并移除失效连接映射。 */
     @Override public void afterConnectionClosed(WebSocketSession session,CloseStatus status){String turn=sessionTurns.remove(session.getId());Long owner=sessionOwners.remove(session.getId());String device=(String)session.getAttributes().get("deviceId");if(device!=null&&turn!=null&&owner!=null)try{if(turns.markDisconnected(device,turn,owner))disconnectTimes.put(turn,Instant.now());}catch(RuntimeException ignored){}if(device!=null)deviceSockets.remove(device,session);}
+    /** 扫描失去所有权、超时或过期命令的轮次并清理资源。 */
     @Scheduled(fixedDelayString="${app.voice.cleanup-interval-ms:5000}") public void cleanupExpired(){Instant now=Instant.now();states.forEach((id,s)->{
         String device=turnDevices.get(id);if(device==null)return;
         synchronized(lockFor(device)){try{

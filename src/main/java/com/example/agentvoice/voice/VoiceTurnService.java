@@ -41,6 +41,7 @@ public class VoiceTurnService {
 
     /** Creates an idempotent turn and atomically enforces one active turn per device. */
     @Transactional
+    /** 幂等创建设备语音轮次并取得设备所有权。 */
     public Turn start(String deviceId,String requestId,AudioFormat format){
         validateFormat(format);
         var device=jdbc.query("SELECT active_turn_id,owner_version FROM device_registry WHERE device_id=? AND enabled=TRUE FOR UPDATE",(rs,n)->new DeviceStartRow(rs.getString(1),rs.getLong(2)),deviceId);
@@ -57,6 +58,7 @@ public class VoiceTurnService {
 
     /** Rebinds a reconnecting socket; loss of node-local audio state always changes ASR attempt. */
     @Transactional
+    /** 校验恢复令牌并接管未过期的语音轮次。 */
     public Turn resume(String deviceId,String turnId,String token,boolean localStateAvailable){
         if(!lockDeviceTurn(deviceId,turnId))throw error(HttpStatus.UNAUTHORIZED,"DEVICE_AUTH_FAILED","设备认证失败");
         var rows=jdbc.query("SELECT state,format_json,attempt_id,resume_token_hash,owner_version,started_at,deadline_at,final_text,disconnected_at FROM voice_turn WHERE turn_id=? AND device_id=? FOR UPDATE",(rs,n)->new ResumeRow(rs.getString(1),rs.getString(2),rs.getString(3),rs.getString(4),rs.getLong(5),rs.getTimestamp(6).toInstant(),rs.getTimestamp(7).toInstant(),rs.getString(8),rs.getTimestamp(9)==null?null:rs.getTimestamp(9).toInstant()),turnId,deviceId);
@@ -73,6 +75,7 @@ public class VoiceTurnService {
 
     /** Commits the unique final result only while this socket still owns an unexpired turn. */
     @Transactional
+    /** 为本地音频状态丢失的轮次创建新 attempt，供设备全量重放。 */
     public Turn restartForFullReplay(String deviceId,String turnId){
         if(!lockDeviceTurn(deviceId,turnId))throw error(HttpStatus.UNAUTHORIZED,"DEVICE_AUTH_FAILED","设备认证失败");
         var rows=jdbc.query("SELECT state,owner_version,deadline_at,resume_token_hash,final_text,disconnected_at FROM voice_turn WHERE turn_id=? AND device_id=? FOR UPDATE",(rs,n)->new Object[]{rs.getString(1),rs.getLong(2),rs.getTimestamp(3).toInstant(),rs.getString(4),rs.getString(5),rs.getTimestamp(6)==null?null:rs.getTimestamp(6).toInstant()},turnId,deviceId);
@@ -86,6 +89,7 @@ public class VoiceTurnService {
 
     /** One winner owns ASR finishInput; the recording deadline does not prohibit this transition. */
     @Transactional
+    /** 用条件更新切换到收尾状态，确保只有一个收尾赢家。 */
     public boolean beginFinalization(String deviceId,String turnId,String attemptId,long ownerVersion){
         if(!lockDeviceTurn(deviceId,turnId))throw error(HttpStatus.CONFLICT,"STALE_OWNER","轮次归属已失效");
         int changed=jdbc.update("UPDATE voice_turn v JOIN device_registry d ON d.device_id=v.device_id SET v.state='PROCESSING',v.processing_deadline_at=? WHERE v.turn_id=? AND v.device_id=? AND v.attempt_id=? AND v.owner_version=? AND d.owner_version=? AND d.active_turn_id=v.turn_id AND v.state='RECORDING'",Timestamp.from(clock.instant().plusMillis(finalizationTimeoutMs)),turnId,deviceId,attemptId,ownerVersion,ownerVersion);
@@ -100,6 +104,7 @@ public class VoiceTurnService {
         return persistFinal(deviceId,turnId,attempt,ownerVersion,finalText);
     }
     @Transactional
+    /** 保存最终识别文本并推进状态，拒绝迟到 attempt 的结果。 */
     public Turn persistFinal(String deviceId,String turnId,String attemptId,long ownerVersion,String finalText){
         if(!lockDeviceTurn(deviceId,turnId))throw error(HttpStatus.CONFLICT,"STALE_OWNER","设备或轮次归属已失效");
         if(finalText==null||finalText.isBlank())throw error(HttpStatus.BAD_REQUEST,"ASR_FINAL_MISSING","最终识别文本为空");
@@ -120,8 +125,11 @@ public class VoiceTurnService {
         var expired=jdbc.query("SELECT turn_id,device_id FROM voice_turn WHERE "+expiry,(rs,n)->new String[]{rs.getString(1),rs.getString(2)});
         for(String[] item:expired){String turnId=item[0],deviceId=item[1];if(!lockDeviceTurn(deviceId,turnId))continue;int changed=jdbc.update("UPDATE voice_turn SET state='FAILED',completed_at=CURRENT_TIMESTAMP(6) WHERE turn_id=? AND device_id=? AND "+expiry,turnId,deviceId);if(changed==1)jdbc.update("UPDATE device_registry SET active_turn_id=NULL WHERE device_id=? AND active_turn_id=?",deviceId,turnId);}
     }
+    /** 校验设备当前仍持有指定版本的活动轮次。 */
     public boolean ownsTurn(String deviceId,String turnId,long ownerVersion){return !jdbc.queryForList("SELECT v.turn_id FROM voice_turn v JOIN device_registry d ON d.device_id=v.device_id AND d.active_turn_id=v.turn_id WHERE v.turn_id=? AND v.device_id=? AND v.owner_version=? AND d.owner_version=? AND v.state IN ('RECORDING','PROCESSING','FINAL') AND d.enabled=TRUE",turnId,deviceId,ownerVersion,ownerVersion).isEmpty();}
+    /** 确认录音 attempt 未过期且仍由当前设备连接持有。 */
     public boolean ownsRecording(String deviceId,String turnId,String attemptId,long ownerVersion){return !jdbc.queryForList("SELECT v.turn_id FROM voice_turn v JOIN device_registry d ON d.active_turn_id=v.turn_id AND d.device_id=v.device_id WHERE v.device_id=? AND v.turn_id=? AND v.attempt_id=? AND v.owner_version=? AND d.owner_version=? AND d.enabled=TRUE AND v.state='RECORDING' AND v.deadline_at>CURRENT_TIMESTAMP(6)",deviceId,turnId,attemptId,ownerVersion,ownerVersion).isEmpty();}
+    /** 确认 ASR 收尾 attempt 未超时且未被新连接接管。 */
     public boolean ownsProcessing(String deviceId,String turnId,String attemptId,long ownerVersion){return !jdbc.queryForList("SELECT v.turn_id FROM voice_turn v JOIN device_registry d ON d.active_turn_id=v.turn_id AND d.device_id=v.device_id WHERE v.device_id=? AND v.turn_id=? AND v.attempt_id=? AND v.owner_version=? AND d.owner_version=? AND d.enabled=TRUE AND v.state='PROCESSING' AND v.processing_deadline_at>CURRENT_TIMESTAMP(6)",deviceId,turnId,attemptId,ownerVersion,ownerVersion).isEmpty();}
 
     private Turn toTurn(String deviceId,TurnRow row){String resume=resumeToken(deviceId,row.turnId());return new Turn(row.turnId(),row.attemptId(),resume,row.ownerVersion(),row.deadline().toString(),row.state(),row.finalText(),"IDEMPOTENT_REPLAY");}

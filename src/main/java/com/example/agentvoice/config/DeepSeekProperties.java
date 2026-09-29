@@ -10,6 +10,7 @@ import java.time.Duration;
 
 @Validated
 @ConfigurationProperties("app.deepseek")
+/** 集中保存模型端点、超时和 Agent 上下文限制。 */
 public record DeepSeekProperties(
         URI baseUrl,
         String model,

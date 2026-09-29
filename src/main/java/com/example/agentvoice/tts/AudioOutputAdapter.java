@@ -3,6 +3,7 @@ package com.example.agentvoice.tts;
 import com.example.agentvoice.audio.AudioFormat;
 import java.util.UUID;
 
+/** 定义语音输出适配器及生成音频的格式。 */
 public interface AudioOutputAdapter {
     AudioFormat format();
     AudioAsset synthesize(String text);

@@ -13,9 +13,11 @@ import java.util.Map;
 public class ContextCompactor {
     private final JdbcTemplate jdbc; private final DeepSeekClient llm; private final ObjectMapper mapper;
     public ContextCompactor(JdbcTemplate jdbc,DeepSeekClient llm,ObjectMapper mapper){this.jdbc=jdbc;this.llm=llm;this.mapper=mapper;}
+    /** 将较早的合格对话压缩为摘要，保留最近轮次原文。 */
     public void compact(String sessionId,String apiKey){
         List<Map<String,Object>> turns=jdbc.queryForList("SELECT m.run_id,MAX(m.seq) max_seq FROM agent_message m JOIN agent_run r ON r.id=m.run_id WHERE m.session_id=? AND "+ModelHistoryFilter.ELIGIBLE_RUN+" GROUP BY m.run_id ORDER BY max_seq DESC",sessionId);
         if(turns.size()<=8)return;
+        // 最新 8 轮保留原文；摘要截止点取更早轮次的末尾序号。
         long cutoff=((Number)turns.get(6).get("max_seq")).longValue();
         var excluded=ModelHistoryFilter.excluded(jdbc,sessionId);
         var old=ModelHistoryFilter.messages(jdbc,sessionId,0,cutoff);
@@ -35,6 +37,7 @@ public class ContextCompactor {
         try{instruction=new String(getClass().getResourceAsStream("/prompts/context-summary.md").readAllBytes(),java.nio.charset.StandardCharsets.UTF_8);}catch(Exception e){throw new IllegalStateException(e);}
         String summary=llm.summarize(apiKey,List.of(Map.of("role","system","content",instruction),Map.of("role","user","content",previous+source)));
         try{
+            // 只接受约定结构完整的摘要，避免模型输出污染后续上下文。
             var node=mapper.readTree(summary);
             for(String key:List.of("facts","entities","pending","constraints")) if(!node.has(key)) return;
             if(node.size()!=4)return;

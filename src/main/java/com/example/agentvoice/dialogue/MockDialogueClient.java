@@ -13,6 +13,7 @@ import java.util.HexFormat;
 public final class MockDialogueClient implements DialogueClient {
     private final JdbcTemplate jdbc;
     public MockDialogueClient(JdbcTemplate jdbc){this.jdbc=jdbc;}
+    /** 幂等保存模拟对话结果，并校验轮次未被不同文本复用。 */
     @Override public DialogueReply submit(String deviceId,String sessionId,String turnId,String finalText) {
         String request="voice:"+turnId,response="已收到："+finalText;
         try{String hash=HexFormat.of().formatHex(MessageDigest.getInstance("SHA-256").digest(finalText.getBytes(java.nio.charset.StandardCharsets.UTF_8)));

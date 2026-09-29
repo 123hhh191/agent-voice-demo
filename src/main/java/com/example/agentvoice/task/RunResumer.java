@@ -11,6 +11,7 @@ public class RunResumer {
     private final JdbcTemplate jdbc;
     public RunResumer(JdbcTemplate jdbc) { this.jdbc = jdbc; }
     @Transactional
+    /** 所有工具调用终态后，原子恢复等待中的 Agent 运行。 */
     public boolean claimResume(String runId) {
         Integer unfinished = jdbc.queryForObject("SELECT COUNT(*) FROM tool_invocation WHERE run_id=? AND state IN ('PREPARED','RUNNING')", Integer.class, runId);
         if (unfinished != null && unfinished > 0) return false;

@@ -28,6 +28,7 @@ public class AgentLoop {
     private final DeepSeekClient llm; private final ToolRegistry tools; private final SessionService sessions;
     private final ContextBuilder context; private final ContextCompactor compactor; private final DeepSeekProperties properties; private final ObjectMapper mapper; private final ToolInvocationService invocations; private final RunEventService events;
     public AgentLoop(DeepSeekClient llm,ToolRegistry tools,SessionService sessions,ContextBuilder context,ContextCompactor compactor,DeepSeekProperties properties,ObjectMapper mapper,ToolInvocationService invocations,RunEventService events){this.llm=llm;this.tools=tools;this.sessions=sessions;this.context=context;this.compactor=compactor;this.properties=properties;this.mapper=mapper;this.invocations=invocations;this.events=events;}
+    /** 执行一轮对话，按需调用工具并保存运行结果。 */
     public SessionService.Run run(String sessionId,String userId,String requestId,String text,String apiKey,String traceId){
         apiKey=DeepSeekApiKey.requireValid(apiKey);
         SessionService.Run run=sessions.start(sessionId,userId,requestId,text,traceId);
@@ -57,6 +58,7 @@ public class AgentLoop {
                 }
                 List<Map<String,Object>> stored=decision.toolCalls().stream().map(c->Map.<String,Object>of("id",c.id(),"type","function","function",Map.of("name",c.name(),"arguments",c.argumentsJson()))).toList();
                 sessions.append(sessionId,run.runId(),"assistant",decision.content(),null,stored);
+                // 每个工具调用单独记账，避免重试时重复产生外部副作用。
                 for(LlmDecision.ToolCall call:decision.toolCalls()){
                     Object result;
                     String operationId=run.runId()+":"+call.id();
@@ -90,5 +92,6 @@ public class AgentLoop {
             throw new ApiException(HttpStatus.BAD_GATEWAY,"AGENT_FAILED","Agent 执行失败");
         }
     }
+    /** 写入可补发事件；事件写入失败不改变运行主状态。 */
     private void recordEvent(String runId,String type,Map<String,Object> payload){try{events.enqueue(runId,type,payload);}catch(RuntimeException ignored){/* 运行状态以 agent_run 为准，事件可由状态查询补偿。 */}}
 }

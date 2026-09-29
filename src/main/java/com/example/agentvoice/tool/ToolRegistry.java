@@ -26,13 +26,17 @@ public class ToolRegistry {
         register("todo_list", "查询当前会话待办。", Map.of("status", Map.of("type", "string", "enum", List.of("PENDING", "COMPLETED", "ALL"))), List.of("status"), "READ_ONLY", "SAFE", 3000, 2, false, todo::list);
         register("todo_update", "按版本更新当前会话待办。", Map.of("todoId", Map.of("type", "string"), "expectedVersion", Map.of("type", "integer", "minimum", 0), "title", Map.of("type", "string", "minLength", 1, "maxLength", 240), "dueAt", Map.of("type", List.of("string", "null"), "format", "date-time"), "status", Map.of("type", "string", "enum", List.of("PENDING", "COMPLETED"))), List.of("todoId", "expectedVersion"), "WRITE", "NEVER", 5000, 1, false, todo::update);
     }
+    /** 注册工具定义、参数约束及执行策略。 */
     private void register(String name, String description, Map<String,Object> props, List<String> required, String effectType, String retryMode, long timeoutMs, int maxAttempts, boolean supportsStatusQuery, BiFunction<JsonNode,ToolExecutionContext,Object> action) {
         if (tools.containsKey(name)) throw new IllegalStateException("重复工具名: " + name);
         Map<String,Object> schema = new LinkedHashMap<>(); schema.put("type", "object"); schema.put("properties", props); schema.put("required", required); schema.put("additionalProperties", false);
         tools.put(name, new Tool(Map.of("type", "function", "function", Map.of("name", name, "description", description, "parameters", schema)), action, props, required, new Metadata(effectType,retryMode,timeoutMs,maxAttempts,supportsStatusQuery)));
     }
+    /** 返回供模型选择的工具定义。 */
     public List<Map<String,Object>> definitions() { return tools.values().stream().map(Tool::definition).toList(); }
+    /** 返回工具的副作用、重试和超时策略。 */
     public Metadata metadata(String name) { Tool tool=tools.get(name); if(tool==null)throw new ApiException(HttpStatus.BAD_REQUEST,"UNKNOWN_TOOL","不支持的工具"); return tool.metadata(); }
+    /** 校验工具参数后执行对应工具。 */
     public Object execute(String name, String json, ToolExecutionContext context) {
         Tool tool = tools.get(name);
         if (tool == null) throw new ApiException(HttpStatus.BAD_REQUEST, "UNKNOWN_TOOL", "不支持的工具");
@@ -47,6 +51,7 @@ public class ToolRegistry {
         // Tool execution can fail because of business rules or infrastructure; preserve that error.
         return tool.action().apply(args, context);
     }
+    /** 按注册时的约束检查必填项、类型、长度和枚举值。 */
     private void validateSchema(JsonNode args, Tool tool) {
         var fields = args.fieldNames();
         while (fields.hasNext()) if (!tool.propertySchemas().containsKey(fields.next())) throw new IllegalArgumentException();

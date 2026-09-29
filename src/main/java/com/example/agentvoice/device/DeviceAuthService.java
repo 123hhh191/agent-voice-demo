@@ -38,6 +38,7 @@ public class DeviceAuthService {
     }
 
     /** Issues a short-lived, single-use challenge only for an enabled, configured device. */
+    /** 为已登记设备签发一次性随机挑战。 */
     public Challenge challenge(String deviceId,String sn) {
         var devices=jdbc.query("SELECT enabled FROM device_registry WHERE device_id=? AND sn=?",(rs,n)->rs.getBoolean(1),deviceId,sn);
         if(devices.isEmpty()||!devices.get(0)||!credentials.containsKey(deviceId)) throw unauthorized();
@@ -51,6 +52,7 @@ public class DeviceAuthService {
 
     /** Verifies the signed nonce and atomically consumes the challenge while creating an opaque token. */
     @Transactional
+    /** 验证挑战签名并签发短期设备访问令牌。 */
     public Token token(TokenRequest request) {
         byte[] secret=credentials.get(request.deviceId());
         if(secret==null) throw unauthorized();
@@ -69,11 +71,13 @@ public class DeviceAuthService {
     }
 
     /** Resolves an unexpired bearer token to its registered device identity. */
+    /** 校验访问令牌有效期和设备状态，返回设备 ID。 */
     public String authenticate(String bearer) {
         if(bearer==null||bearer.length()<32||bearer.length()>256)throw unauthorized();
         var rows=jdbc.query("SELECT t.device_id FROM device_access_token t JOIN device_registry d ON d.device_id=t.device_id WHERE t.token_hash=? AND t.revoked_at IS NULL AND t.expires_at>CURRENT_TIMESTAMP(6) AND d.enabled=TRUE",(rs,n)->rs.getString(1),sha256(bearer));
         if(rows.isEmpty())throw unauthorized(); return rows.get(0);
     }
+    /** 返回指定设备的密钥副本，避免外部修改缓存内容。 */
     public byte[] credential(String deviceId){byte[] key=credentials.get(deviceId);if(key==null)throw unauthorized();return key.clone();}
 
     @Transactional public void revokeDevice(String deviceId) {
@@ -83,6 +87,7 @@ public class DeviceAuthService {
         jdbc.update("UPDATE device_access_token SET revoked_at=CURRENT_TIMESTAMP(6) WHERE device_id=? AND revoked_at IS NULL",deviceId);
     }
 
+    /** 解析环境变量注入的设备密钥映射。 */
     private Map<String,byte[]> parseCredentials(String input) {
         java.util.Map<String,byte[]> parsed=new java.util.HashMap<>();
         for(String item:input.split(";")) { if(item.isBlank())continue; int ix=item.indexOf('='); if(ix<1)throw new IllegalArgumentException("app.device.credentials must use deviceId=base64 pairs");
@@ -90,6 +95,7 @@ public class DeviceAuthService {
         return Map.copyOf(parsed);
     }
     @Scheduled(fixedDelayString="${app.device.cleanup-interval-ms:3600000}")
+    /** 清除过期挑战及过期或已撤销的访问令牌。 */
     public void cleanupExpired(){jdbc.update("DELETE FROM device_challenge WHERE expires_at<CURRENT_TIMESTAMP(6)");jdbc.update("DELETE FROM device_access_token WHERE expires_at<CURRENT_TIMESTAMP(6) OR revoked_at<CURRENT_TIMESTAMP(6)-INTERVAL 1 DAY");}
     private String randomToken(){byte[] b=new byte[32];random.nextBytes(b);return Base64.getUrlEncoder().withoutPadding().encodeToString(b);}
     private String hmac(byte[] key,String value){try{Mac mac=Mac.getInstance("HmacSHA256");mac.init(new SecretKeySpec(key,"HmacSHA256"));return HexFormat.of().formatHex(mac.doFinal(value.getBytes(StandardCharsets.UTF_8)));}catch(Exception ex){throw new IllegalStateException(ex);}}

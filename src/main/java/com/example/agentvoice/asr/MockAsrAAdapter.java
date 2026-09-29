@@ -17,12 +17,14 @@ public final class MockAsrAAdapter implements AsrProviderAdapter {
     static class Session implements AsrSession {
         final String attempt, text; int frames; boolean closed, finished;
         Session(String attempt, String text) { this.attempt = attempt; this.text = text; }
+        /** 模拟流式识别，前两帧依次返回递增版本的 partial。 */
         @Override public List<AsrEvent> submit(AudioEvent f) {
             if (closed || finished) return List.of(); frames++;
             if (frames == 1 && text.length() > 1) return List.of(new AsrEvent(attempt, "0", 1, AsrEvent.Type.PARTIAL, text.substring(0, Math.max(1, text.length()/2)), null));
             if (frames == 2) return List.of(new AsrEvent(attempt, "0", 2, AsrEvent.Type.PARTIAL, text, null));
             return List.of();
         }
+        /** 录音结束时返回最终模拟识别文本。 */
         @Override public List<AsrEvent> finishInput() { if (closed || finished) return List.of(); finished = true; return List.of(new AsrEvent(attempt, "0", 3, AsrEvent.Type.FINAL, text, null)); }
         @Override public void cancel() { closed = true; }
         @Override public void close() { closed = true; }

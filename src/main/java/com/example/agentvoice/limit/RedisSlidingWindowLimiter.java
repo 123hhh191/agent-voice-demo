@@ -23,6 +23,7 @@ public final class RedisSlidingWindowLimiter implements SlidingWindowLimiter {
         this.script.setResultType(Long.class);
     }
 
+    /** 通过 Redis Lua 原子维护用户窗口并检查配额。 */
     @Override public boolean allow(String userId) {
         if (userId == null || userId.isBlank()) throw new IllegalArgumentException("userId is required");
         String key = "rate:{" + tenantId + ":" + userId + "}:dialogue";

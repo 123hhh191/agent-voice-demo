@@ -24,6 +24,7 @@ public final class InMemorySlidingWindowLimiter implements SlidingWindowLimiter 
         this.clock = clock;
     }
 
+    /** 原子清理过期请求并判断用户是否仍有配额。 */
     @Override public boolean allow(String userId) {
         if (userId == null || userId.isBlank()) throw new IllegalArgumentException("userId is required");
         boolean[] allowed = new boolean[1];
@@ -40,6 +41,7 @@ public final class InMemorySlidingWindowLimiter implements SlidingWindowLimiter 
     }
 
     @Scheduled(fixedDelayString = "${app.rate-limit.cleanup-interval:60000}")
+    /** 删除已无窗口内请求的用户记录，限制内存占用。 */
     public void cleanup() {
         windows.forEach((key, ignored) -> windows.computeIfPresent(key, (k, q) -> {
             prune(q, clock.getAsLong());
@@ -48,6 +50,7 @@ public final class InMemorySlidingWindowLimiter implements SlidingWindowLimiter 
     }
 
     int trackedUsers() { return windows.size(); }
+    /** 移除已离开滑动时间窗的请求时间戳。 */
     private void prune(ArrayDeque<Long> q, long now) {
         while (!q.isEmpty() && now - q.peekFirst() >= windowNanos) q.removeFirst();
     }

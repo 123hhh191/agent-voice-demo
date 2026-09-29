@@ -12,6 +12,7 @@ public final class MockAsrBAdapter implements AsrProviderAdapter {
     @Override public Set<AudioFormat> supportedFormats() { return Set.of(AudioFormat.PCM16_MONO_16K); }
     @Override public boolean streaming() { return false; }
     @Override public boolean partialResults() { return false; }
+    /** 创建只在输入结束时返回识别结果的模拟会话。 */
     @Override public AsrSession open(String attemptId, String fixtureText) {
         return new AsrSession() {
             boolean closed, done;

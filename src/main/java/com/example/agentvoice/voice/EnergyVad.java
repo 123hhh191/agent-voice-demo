@@ -13,6 +13,7 @@ public final class EnergyVad implements EndpointDetector {
         if (silenceMs<1||maxMs<1||noSpeechMs<1||thresholdRms<0) throw new IllegalArgumentException("invalid endpoint settings");
         this.silenceMs=silenceMs;this.maxMs=maxMs;this.noSpeechMs=noSpeechMs;this.thresholdRms=thresholdRms;
     }
+    /** 按帧能量与录音时长判断静音、无语音或时长端点。 */
     @Override public synchronized Optional<Cause> accept(AudioEvent frame,long elapsedMs) {
         if (ended) return Optional.empty();
         if (elapsedMs>=maxMs) return Optional.of(seenSpeech?finish(Cause.MAX_DURATION):finish(Cause.NO_SPEECH));
@@ -26,6 +27,7 @@ public final class EnergyVad implements EndpointDetector {
         return Optional.empty();
     }
     @Override public synchronized Optional<Cause> end() { return Optional.of(finish(seenSpeech?Cause.END:Cause.NO_SPEECH)); }
+    /** 无新音频帧时仍推进无语音与最大时长截止。 */
     @Override public synchronized Optional<Cause> timeout(long elapsedMs) {
         if (ended) return Optional.empty();
         if (seenSpeech && elapsedMs >= maxMs) return Optional.of(finish(Cause.MAX_DURATION));
@@ -33,6 +35,7 @@ public final class EnergyVad implements EndpointDetector {
         return Optional.empty();
     }
     public static boolean isSpeech(byte[] pcm) { return isSpeech(pcm, 0.015); }
+    /** 将小端 PCM16 样本换算为 RMS，达到阈值时视为有语音。 */
     private static boolean isSpeech(byte[] pcm,double threshold) { if (pcm.length<2) return false; ByteBuffer b=ByteBuffer.wrap(pcm).order(ByteOrder.LITTLE_ENDIAN); double squares=0;int n=0;while(b.remaining()>=2){double v=b.getShort()/32768.0;squares+=v*v;n++;}return n>0&&Math.sqrt(squares/n)>=threshold; }
     private Cause finish(Cause cause){ended=true;return cause;}
     public synchronized boolean seenSpeech(){return seenSpeech;}

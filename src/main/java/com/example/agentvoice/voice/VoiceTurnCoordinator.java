@@ -34,14 +34,17 @@ public final class VoiceTurnCoordinator {
         if(!asr.supportedFormats().contains(com.example.agentvoice.audio.AudioFormat.PCM16_MONO_16K))throw new IllegalArgumentException("ASR provider does not support the configured PCM16 format: "+provider);
         this.dialogue=dialogue;this.output=output;this.commands=commands;this.policy=policy;
     }
+    /** 为设备创建新语音轮次并打开 ASR 会话。 */
     public synchronized void start(String deviceId,String turnId,String attemptId,String fixtureText) {
         Turn prior=turns.get(deviceId); if(prior!=null&&prior.state!=State.IDLE&&prior.state!=State.FAILED)throw new IllegalStateException("device already has active voice turn");
         turns.put(deviceId,new Turn(deviceId,turnId,attemptId,fixtureText,asr.open(attemptId,fixtureText)));
     }
+    /** 丢弃该设备旧轮次并用新 attempt 重建 ASR 会话。 */
     public synchronized void restart(String deviceId,String turnId,String attemptId,String fixtureText) {
         Turn prior=turns.get(deviceId);if(prior!=null)closeAsr(prior,true);
         turns.put(deviceId,new Turn(deviceId,turnId,attemptId,fixtureText,asr.open(attemptId,fixtureText)));
     }
+    /** 接收一帧音频，更新 VAD、ASR 与轮次状态。 */
     public synchronized State accept(AudioEvent raw,long elapsedMs) {
         Turn t=require(raw.deviceId(),raw.turnId(),raw.attemptId()); if(t.state!=State.LISTENING&&t.state!=State.SPEAKING)return t.state;
         AudioEvent frame=normalizer.normalize(raw); var endpoint=t.endpoint.accept(frame,elapsedMs);
@@ -50,9 +53,12 @@ public final class VoiceTurnCoordinator {
         else {for(AsrEvent event:t.asr.submit(frame))applyAsr(t,event);if(t.asrError!=null){t.failureCode="ASR_FAILED";t.state=State.FAILED;closeAsr(t,true);}else endpoint.ifPresent(cause->finalizeTurn(t,cause));}
         return t.state;
     }
+    /** 结束录音并进入 ASR 收尾阶段。 */
     public synchronized State end(String deviceId,String turnId,String attemptId) { Turn t=require(deviceId,turnId,attemptId);if(t.state!=State.LISTENING&&t.state!=State.SPEAKING)return t.state;finalizeTurn(t,t.endpoint.end().orElse(EndpointDetector.Cause.NO_SPEECH));return t.state; }
+    /** 在没有新帧时推进 VAD 的无语音和最大时长截止。 */
     public synchronized State timeout(String deviceId,long elapsedMs) { Turn t=turns.get(deviceId);if(t==null||(t.state!=State.LISTENING&&t.state!=State.SPEAKING))return t==null?State.IDLE:t.state;t.endpoint.timeout(elapsedMs).ifPresent(cause->finalizeTurn(t,cause));return t.state; }
     /** Called only after the caller commits the final ASR text to voice_turn. */
+    /** 将已落库的最终识别文本交给对话服务并创建播报命令。 */
     public State deliverDialogue(String deviceId,String turnId){
         Turn t;
         synchronized(this){t=turns.get(deviceId);if(t==null||!t.turnId.equals(turnId)||t.state!=State.DIALOGUE_PENDING)return t==null?State.IDLE:t.state;if(t.dialogueStarted)return t.state;t.dialogueStarted=true;}
@@ -66,10 +72,13 @@ public final class VoiceTurnCoordinator {
         }catch(RuntimeException ex){synchronized(this){if(turns.get(deviceId)==t){t.failureCode="DIALOGUE_OR_OUTPUT_FAILED";t.state=State.FAILED;}}log.error("Voice dialogue/output failed deviceId={} turnId={}",deviceId,turnId,ex);}
         return state(deviceId);
     }
+    /** 取消当前轮次；若正在播报，同时生成停止命令。 */
     public synchronized DeviceCommand cancel(String deviceId,String turnId,String attemptId) { Turn t=require(deviceId,turnId,attemptId);DeviceCommand stop=null;if(t.state==State.PLAYING){stop=new DeviceCommand(UUID.randomUUID().toString(),deviceId,turnId,DeviceCommand.Type.STOP_PLAYBACK,2,Instant.now().plusSeconds(10),Map.of("reason","turn_cancelled"));commands.persist(stop);}t.state=State.IDLE;turns.remove(deviceId,t);closeAsr(t,true);return stop; }
     /** Removes only the specified attempt; a late worker must never discard its successor. */
+    /** 仅清理匹配的 attempt，避免迟到任务删掉新轮次。 */
     public synchronized void discard(String deviceId,String turnId,String attemptId){Turn t=turns.get(deviceId);if(t!=null&&t.turnId.equals(turnId)&&t.attemptId.equals(attemptId)){turns.remove(deviceId,t);closeAsr(t,true);}}
     public synchronized String endpointCause(String deviceId){Turn t=turns.get(deviceId);return t==null||t.cause==null?"UNKNOWN":t.cause.name();}
+    /** 校验当前播报命令并持久化设备 ACK。 */
     public synchronized void commandAck(String deviceId,String turnId,String commandId) { Turn t=turns.get(deviceId);if(t==null||!t.turnId.equals(turnId)||t.state!=State.PLAYING||!t.commandId.equals(commandId))throw new IllegalArgumentException("stale command ACK");if(!commands.acknowledge(deviceId,turnId,commandId))throw new IllegalArgumentException("command expired or unknown"); }
     /** Clears only the matching in-memory turn after VoicePlaybackService has committed it. */
     public synchronized PlaybackResult playbackFinished(String deviceId,String turnId,String commandId) {
@@ -84,6 +93,7 @@ public final class VoiceTurnCoordinator {
     public synchronized DeviceCommand command(String deviceId,String turnId){Turn t=turns.get(deviceId);if(t==null||!t.turnId.equals(turnId)||t.command==null||!commands.mayDispatch(t.commandId))return null;return t.command;}
     public synchronized String failureCode(String deviceId){Turn t=turns.get(deviceId);return t==null||t.failureCode==null?"VOICE_TURN_FAILED":t.failureCode;}
     public synchronized boolean commandExpired(String deviceId){Turn t=turns.get(deviceId);return t==null||t.command==null||!t.command.deadline().isAfter(Instant.now());}
+    /** 幂等记录端点原因；无语音直接失败，其余转入收尾态。 */
     private void finalizeTurn(Turn t,EndpointDetector.Cause cause) {
         if(t.finalized)return;t.finalized=true;
         t.cause=cause;
@@ -106,7 +116,9 @@ public final class VoiceTurnCoordinator {
         finally{closeAsr(t,false);}
         return state(deviceId);
     }
+    /** 确保 ASR 会话只关闭一次，并按需取消提供方任务。 */
     private void closeAsr(Turn t,boolean cancel){if(t.closed.compareAndSet(false,true)){try{if(cancel)t.asr.cancel();}finally{t.asr.close();}}}
+    /** 按 attempt 与 revision 过滤迟到或过期 ASR 片段。 */
     private void applyAsr(Turn t,AsrEvent e) {
         if(!t.attemptId.equals(e.attemptId()))return;
         if(e.type()==AsrEvent.Type.ERROR){t.asrError=e.errorCode()==null?"ASR_ERROR":e.errorCode();return;}

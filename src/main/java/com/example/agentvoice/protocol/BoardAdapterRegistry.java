@@ -12,6 +12,7 @@ public final class BoardAdapterRegistry {
     public BoardAdapterRegistry(List<BoardProtocolAdapter> adapters) {
         this.adapters = adapters.stream().collect(Collectors.toUnmodifiableMap(BoardProtocolAdapter::model, Function.identity()));
     }
+    /** 按配置的板卡型号获取协议适配器。 */
     public BoardProtocolAdapter require(String model) {
         BoardProtocolAdapter adapter = adapters.get(model);
         if (adapter == null) throw new IllegalArgumentException("unsupported board model: " + model);

@@ -25,6 +25,7 @@ public class RunEventController {
     private final Executor executor = new ThreadPoolExecutor(2,4,30,TimeUnit.SECONDS,new ArrayBlockingQueue<>(64),r -> { Thread t = new Thread(r,"run-event-stream"); t.setDaemon(true); return t; },new ThreadPoolExecutor.AbortPolicy());
     public RunEventController(SessionService sessions, RunEventService events, UserIdentity identity) { this.sessions=sessions;this.events=events;this.identity=identity; }
 
+    /** 校验运行归属后以 SSE 持续发送后续事件。 */
     @GetMapping(value="/api/runs/{runId}/events", produces=MediaType.TEXT_EVENT_STREAM_VALUE)
     public SseEmitter stream(@PathVariable String runId, @RequestParam(defaultValue="0") long afterSeq, HttpServletRequest request) {
         if (afterSeq < 0) throw new ApiException(HttpStatus.BAD_REQUEST,"INVALID_CURSOR","afterSeq 必须大于等于 0");

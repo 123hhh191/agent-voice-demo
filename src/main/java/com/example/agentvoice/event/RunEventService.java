@@ -15,6 +15,7 @@ public class RunEventService {
     private final JdbcTemplate jdbc; private final ObjectMapper mapper;
     public RunEventService(JdbcTemplate jdbc, ObjectMapper mapper) { this.jdbc = jdbc; this.mapper = mapper; }
     @Transactional
+    /** 直接追加运行事件并返回事件序号。 */
     public long append(String runId, String type, Object payload) {
         try {
             String eventId = UUID.randomUUID().toString();
@@ -25,6 +26,7 @@ public class RunEventService {
         } catch (Exception ex) { throw new IllegalStateException("Cannot persist run event", ex); }
     }
     @Transactional
+    /** 将事件写入 outbox，等待异步派发。 */
     public String enqueue(String runId, String type, Object payload) {
         try {
             String id=UUID.randomUUID().toString();
@@ -32,6 +34,7 @@ public class RunEventService {
             return id;
         } catch (Exception ex) { throw new IllegalStateException("Cannot enqueue run event",ex); }
     }
+    /** 查询指定序号之后的运行事件。 */
     public List<Map<String,Object>> after(String runId, long afterSeq, int limit) {
         return jdbc.queryForList("SELECT run_id,event_seq,event_id,type,payload,created_at FROM run_event WHERE run_id=? AND event_seq>? ORDER BY event_seq LIMIT ?",runId,afterSeq,limit);
     }

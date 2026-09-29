@@ -18,6 +18,7 @@ import java.util.UUID;
 public class TodoTool {
     private final JdbcTemplate jdbc;
     public TodoTool(JdbcTemplate jdbc) { this.jdbc = jdbc; }
+    /** 在当前用户会话下创建待办事项。 */
     public Object create(JsonNode a, ToolExecutionContext c) {
         String title = a.path("title").asText("").trim(); validateTitle(title);
         String id = UUID.randomUUID().toString(); OffsetDateTime due = parseDue(a.get("dueAt"));
@@ -25,6 +26,7 @@ public class TodoTool {
                 id,c.userId(),c.sessionId(),title,due == null ? null : Timestamp.from(due.toInstant()),c.operationId());
         return Map.of("todoId", id, "title", title, "status", "PENDING", "version", 0);
     }
+    /** 按状态查询当前用户会话的待办事项。 */
     public Object list(JsonNode a, ToolExecutionContext c) {
         String status = a.path("status").asText("ALL");
         if (!List.of("PENDING","COMPLETED","ALL").contains(status)) throw invalid();
@@ -32,6 +34,7 @@ public class TodoTool {
         List<Map<String,Object>> rows = status.equals("ALL") ? jdbc.queryForList(sql,c.userId(),c.sessionId()) : jdbc.queryForList(sql,c.userId(),c.sessionId(),status);
         return Map.of("items", rows);
     }
+    /** 按预期版本更新待办，版本不匹配时返回冲突。 */
     public Object update(JsonNode a, ToolExecutionContext c) {
         String id = a.path("todoId").asText(""); long version = a.path("expectedVersion").asLong(-1);
         boolean hasTitle = a.has("title"), hasDue = a.has("dueAt"), hasStatus = a.has("status");

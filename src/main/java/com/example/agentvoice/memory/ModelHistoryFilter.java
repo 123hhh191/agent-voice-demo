@@ -26,12 +26,14 @@ final class ModelHistoryFilter {
 
     private ModelHistoryFilter() { }
 
+    /** 查询不能进入模型上下文的凭据失败运行。 */
     static List<Map<String,Object>> excluded(JdbcTemplate jdbc, String sessionId) {
         return jdbc.queryForList("SELECT r.id run_id,MIN(m.seq) first_seq FROM agent_run r "
                 + "JOIN agent_message m ON m.run_id=r.id WHERE r.session_id=? AND " + EXCLUDED_RUN
                 + " GROUP BY r.id", sessionId);
     }
 
+    /** 读取指定序号范围内可供模型使用的消息。 */
     static List<Map<String,Object>> messages(JdbcTemplate jdbc, String sessionId, long after, long through) {
         return jdbc.queryForList("SELECT m.seq,m.run_id,m.role,m.content,m.tool_call_id,m.tool_calls_json "
                 + "FROM agent_message m JOIN agent_run r ON r.id=m.run_id "
@@ -39,6 +41,7 @@ final class ModelHistoryFilter {
                 sessionId, after, through);
     }
 
+    /** 确认摘要已标记其覆盖范围内所有被排除的运行。 */
     static boolean safeSummary(JsonNode summary, long covered, List<Map<String,Object>> excluded) {
         Set<String> recorded = new java.util.HashSet<>();
         summary.path(EXCLUDED_IDS).forEach(id -> recorded.add(id.asText()));
@@ -46,12 +49,14 @@ final class ModelHistoryFilter {
                 .allMatch(row -> recorded.contains(row.get("run_id").toString()));
     }
 
+    /** 移除仅供服务端校验的元数据，生成给模型看的摘要。 */
     static String promptSummary(JsonNode summary) {
         ObjectNode clean = ((ObjectNode) summary).deepCopy();
         clean.remove(EXCLUDED_IDS);
         return clean.toString();
     }
 
+    /** 在摘要中记录截止序号之前被排除的运行 ID。 */
     static void markSummary(ObjectMapper mapper, ObjectNode summary, long covered, List<Map<String,Object>> excluded) {
         var ids = excluded.stream().filter(row -> ((Number)row.get("first_seq")).longValue() <= covered)
                 .map(row -> row.get("run_id").toString()).collect(Collectors.toList());

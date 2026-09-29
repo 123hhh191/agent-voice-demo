@@ -35,6 +35,7 @@ public class DeepSeekClient {
         this.client = RestClient.builder().baseUrl(properties.baseUrl().toString()).requestFactory(factory).build();
     }
 
+    /** 请求模型生成下一步回复或工具调用，并校验响应结构。 */
     public LlmDecision decide(String apiKey, List<Map<String, Object>> messages, List<Map<String, Object>> tools) {
         Map<String, Object> request = Map.of("model", properties.model(), "messages", messages, "tools", tools,
                 "tool_choice", "auto", "thinking", Map.of("type", "disabled"), "stream", false, "max_tokens", 4000);
@@ -50,6 +51,7 @@ public class DeepSeekClient {
         }
     }
 
+    /** 请求模型将历史消息压缩为 JSON 摘要文本。 */
     public String summarize(String apiKey, List<Map<String,Object>> messages) {
         Map<String,Object> request=Map.of("model",properties.model(),"messages",messages,"stream",false,
                 "thinking",Map.of("type","disabled"),"max_tokens",1200,"response_format",Map.of("type","json_object"));
@@ -68,6 +70,7 @@ public class DeepSeekClient {
         return "Bearer " + DeepSeekApiKey.requireValid(apiKey);
     }
 
+    /** 将上游 HTTP 错误映射为脱敏的应用错误。 */
     private ApiException modelError(RestClientResponseException ex, String genericMessage) {
         if (ex.getStatusCode().value() == 401 || ex.getStatusCode().value() == 403)
             return new ApiException(HttpStatus.UNAUTHORIZED, "DEEPSEEK_API_KEY_INVALID", "DeepSeek API Key 无效或无权访问当前模型");
@@ -75,6 +78,7 @@ public class DeepSeekClient {
         return new ApiException(HttpStatus.BAD_GATEWAY, "MODEL_UNAVAILABLE", genericMessage);
     }
 
+    /** 检查模型响应、结束原因及工具调用参数。 */
     LlmDecision parse(JsonNode root) {
         JsonNode choices = root == null ? null : root.path("choices");
         if (choices == null || !choices.isArray() || choices.isEmpty() || !choices.get(0).path("message").isObject())

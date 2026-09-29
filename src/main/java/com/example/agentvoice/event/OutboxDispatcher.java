@@ -15,10 +15,12 @@ public class OutboxDispatcher {
     public OutboxDispatcher(JdbcTemplate jdbc) { this.jdbc = jdbc; }
     @Scheduled(fixedDelayString = "${app.outbox.poll-interval:500}")
     @Transactional
+    /** 批量读取待派发事件并持久化为运行事件。 */
     public void dispatch() {
         List<Map<String,Object>> rows = jdbc.queryForList("SELECT id,aggregate_id,type,payload FROM outbox_event WHERE state='PENDING' AND next_attempt_at<=CURRENT_TIMESTAMP(6) ORDER BY created_at LIMIT 32");
         for (Map<String,Object> row : rows) dispatchOne(row);
     }
+    /** 幂等派发单条 outbox 记录，失败时安排稍后重试。 */
     protected void dispatchOne(Map<String,Object> row) {
         String id = row.get("id").toString();
         int inserted = jdbc.update("INSERT IGNORE INTO run_event(run_id,event_seq,event_id,type,payload) SELECT ?,COALESCE(MAX(event_seq),0)+1,?,?,? FROM run_event WHERE run_id=?",

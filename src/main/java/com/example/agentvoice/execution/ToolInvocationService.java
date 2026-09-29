@@ -23,6 +23,7 @@ public class ToolInvocationService {
     public ToolInvocationService(JdbcTemplate jdbc, ObjectMapper mapper) { this.jdbc = jdbc; this.mapper = mapper; }
 
     @Transactional
+    /** 规范化参数并创建或复用幂等调用记录。 */
     public Invocation prepare(String runId, String toolCallId, String operationId, String toolName, String argsJson) {
         try {
             JsonNode parsed = mapper.readTree(argsJson);
@@ -46,11 +47,13 @@ public class ToolInvocationService {
     }
 
     @Transactional
+    /** 以版本条件原子认领调用，防止并发重复执行。 */
     public boolean claim(String invocationId, long expectedVersion) {
         return jdbc.update("UPDATE tool_invocation SET state='RUNNING',owner_version=owner_version+1 WHERE id=? AND state IN ('PREPARED','RUNNING') AND owner_version=?", invocationId, expectedVersion) == 1;
     }
 
     @Transactional
+    /** 保存终态与结果，仅允许当前认领版本提交。 */
     public boolean complete(String invocationId, long ownerVersion, String state, Object result) {
         if (!java.util.List.of("SUCCEEDED","FAILED","UNKNOWN").contains(state)) throw new IllegalArgumentException("terminal invocation state required");
         try {

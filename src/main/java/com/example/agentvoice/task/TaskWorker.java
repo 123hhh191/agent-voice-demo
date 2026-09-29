@@ -18,6 +18,7 @@ public class TaskWorker {
             Thread thread = new Thread(r, "agent-task-worker"); thread.setDaemon(true); return thread;
         }, new ThreadPoolExecutor.AbortPolicy());
     }
+    /** 将任务提交到有界工作队列，队列满时由调用方处理拒绝。 */
     public void submit(Runnable task) { executor.execute(task); }
     /** Allows voice timeout/cancellation to interrupt a queued or running finishInput. */
     public java.util.concurrent.Future<?> submitCancellable(Runnable task) { return executor.submit(task); }

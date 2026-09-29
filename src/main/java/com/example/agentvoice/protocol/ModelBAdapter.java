@@ -13,6 +13,7 @@ public final class ModelBAdapter implements BoardProtocolAdapter {
     private final ObjectMapper mapper;
     public ModelBAdapter(ObjectMapper mapper) { this.mapper = mapper; }
     @Override public String model() { return "MODEL_B"; }
+    /** 校验 JSON 帧并将 Base64 音频转换为内部事件。 */
     @Override public AudioEvent decodeAudio(String trustedDeviceId, byte[] wire) {
         try {
             if (wire == null || wire.length > 32_768) throw new IllegalArgumentException("ModelB frame exceeds wire limit");
@@ -24,5 +25,6 @@ public final class ModelBAdapter implements BoardProtocolAdapter {
                     Base64.getDecoder().decode(n.path("payload").asText()), n.path("last").asBoolean());
         } catch (Exception e) { if (e instanceof IllegalArgumentException iae) throw iae; throw new IllegalArgumentException("invalid ModelB audio event", e); }
     }
+    /** 将设备命令编码为 ModelB JSON 字节。 */
     @Override public byte[] encodeCommand(DeviceCommand command) { return command.toJson().getBytes(java.nio.charset.StandardCharsets.UTF_8); }
 }

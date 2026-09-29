@@ -12,6 +12,7 @@ import java.io.IOException;
 @Component
 public class TraceFilter extends OncePerRequestFilter {
     @Override
+    /** 为请求建立 traceId，在响应头回传后清理线程上下文。 */
     protected void doFilterInternal(HttpServletRequest request, HttpServletResponse response, FilterChain chain) throws ServletException, IOException {
         String trace = TraceContext.begin(request.getHeader("X-Request-Trace"));
         request.setAttribute("traceId", trace);

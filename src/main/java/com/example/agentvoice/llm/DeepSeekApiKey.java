@@ -7,6 +7,7 @@ import org.springframework.http.HttpStatus;
 public final class DeepSeekApiKey {
     private DeepSeekApiKey() { }
 
+    /** 校验 API Key 是否存在且长度合理，并返回原值。 */
     public static String requireValid(String value) {
         if (value == null || value.isBlank())
             throw new ApiException(HttpStatus.BAD_REQUEST, "DEEPSEEK_API_KEY_REQUIRED", "请先配置 DeepSeek API Key");
