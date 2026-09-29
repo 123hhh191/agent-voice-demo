@@ -114,8 +114,11 @@ public class DeviceGateway extends AbstractWebSocketHandler {
         var resumedEvent=new java.util.LinkedHashMap<String,Object>();resumedEvent.put("version",1);resumedEvent.put("type","resumed");resumedEvent.put("turnId",turnId);resumedEvent.put("asrAttemptId",resumed.attemptId());resumedEvent.put("ownerVersion",resumed.ownerVersion());resumedEvent.put("receivedThrough",state.receivedThrough());resumedEvent.put("missingRanges",state.missingRanges());resumedEvent.put("resumeStrategy",resumed.resumeStrategy());resumedEvent.put("deadlineAt",resumed.deadlineAt());var pendingCommand=commands.findPending(device,turnId);if(pendingCommand!=null&&commands.mayDispatch(pendingCommand.commandId()))resumedEvent.put("command",pendingCommand);send(session,resumedEvent);
     }
 
-    private void end(WebSocketSession session,String device,JsonNode payload)throws Exception{
-        String turnId=payload.path("turnId").asText("");TurnState state=requireOwner(session,device,turnId);JsonNode lastNode=payload.path("lastSeq");if(!lastNode.isIntegralNumber())throw new ProtocolError("INVALID_SEQUENCE",false);long last=lastNode.asLong(-1);state.end(last);
+    private void end(WebSocketSession session,String device,JsonNode payload)throws Exception{synchronized(lockFor(device)){endLocked(session,device,payload);}}
+    private void endLocked(WebSocketSession session,String device,JsonNode payload)throws Exception{
+        String turnId=payload.path("turnId").asText("");TurnState state=requireOwner(session,device,turnId);
+        var phase=coordinator.state(device);if(phase!=VoiceTurnCoordinator.State.LISTENING&&phase!=VoiceTurnCoordinator.State.SPEAKING){sendAck(session,turnId,state);return;}
+        JsonNode lastNode=payload.path("lastSeq");if(!lastNode.isIntegralNumber())throw new ProtocolError("INVALID_SEQUENCE",false);long last=lastNode.asLong(-1);state.end(last);
         sendAck(session,turnId,state);
         long ownerVersion=state.ownerVersion();
         if(state.claimFinalize())finish(session,device,state);else timer.schedule(()->{
@@ -149,23 +152,28 @@ public class DeviceGateway extends AbstractWebSocketHandler {
     private void advance(String device,TurnState state){synchronized(lockFor(device)){
         String id=state.turnId().toString();if(states.get(id)!=state)return;
         try{
-            var phase=coordinator.timeout(device,state.elapsedMs());
+            long elapsed=state.elapsedMs();Instant recordingDeadline=deadlines.get(id);
+            if(recordingDeadline!=null&&!Instant.now().isBefore(recordingDeadline))elapsed=Math.max(elapsed,30_000);
+            var phase=coordinator.timeout(device,elapsed);
             if(phase==VoiceTurnCoordinator.State.FAILED){failTurn(device,state,coordinator.failureCode(device));return;}
             if(phase!=VoiceTurnCoordinator.State.FINALIZING||finalizations.containsKey(id))return;
             long owner=state.ownerVersion();String attempt=state.attemptId().toString();
             if(!turns.beginFinalization(device,id,attempt,owner))return;
             state.stopInput();cancelRecordingTimers(id);
-            var job=new FinalizationJob(owner,Instant.now().plusMillis(turns.finalizationTimeoutMs()));finalizations.put(id,job);
-            log.info("ASR finalization started traceId={} deviceId={} turnId={} attemptId={} ownerVersion={} cause={} deadlineType=PROCESSING",TraceContext.current(),device,id,attempt,owner,coordinator.endpointCause(device));
-            job.timeout=timer.schedule(()->{synchronized(lockFor(device)){if(finalizations.get(id)==job)failTurn(device,state,"ASR_FINAL_TIMEOUT");}},turns.finalizationTimeoutMs(),TimeUnit.MILLISECONDS);
+            var job=new FinalizationJob(owner,Instant.now().plusMillis(turns.finalizationTimeoutMs()),traceId());finalizations.put(id,job);
+            log.info("ASR finalization started traceId={} deviceId={} turnId={} attemptId={} ownerVersion={} cause={} deadlineType=PROCESSING",job.traceId,device,id,attempt,owner,coordinator.endpointCause(device));
+            job.timeout=timer.schedule(()->{TraceContext.begin(job.traceId);try{synchronized(lockFor(device)){if(finalizations.get(id)==job)failTurn(device,state,"ASR_FINAL_TIMEOUT");}}finally{TraceContext.clear();}},turns.finalizationTimeoutMs(),TimeUnit.MILLISECONDS);
             try{job.work=worker.submitCancellable(()->{
+                job.runningThread=Thread.currentThread();
+                String priorTrace=TraceContext.current();TraceContext.begin(job.traceId);
                 try{
                     if(!turns.ownsProcessing(device,id,attempt,owner))return;
                     coordinator.finishInput(device,id,attempt);
                     if(states.get(id)!=state||state.ownerVersion()!=owner)return;
                     deliverFinal(deviceSockets.get(device),device,state);
                 }catch(ApiException ex){log.warn("ASR final result rejected deviceId={} turnId={} code={}",device,id,ex.code());}
-                catch(Exception ex){log.error("ASR finalization worker failed deviceId={} turnId={}",device,id,ex);if(states.get(id)==state)failTurn(device,state,"ASR_FAILED");}
+                catch(Exception ex){log.error("ASR finalization worker failed traceId={} deviceId={} turnId={}",job.traceId,device,id,ex);if(states.get(id)==state)failTurn(device,state,"ASR_FAILED");}
+                finally{if(priorTrace==null)TraceContext.clear();else TraceContext.begin(priorTrace);}
             });}catch(java.util.concurrent.RejectedExecutionException ex){failTurn(device,state,"ASR_BUSY");}
         }catch(ApiException ex){log.warn("Voice finalization ownership rejected deviceId={} turnId={} code={}",device,id,ex.code());}
         catch(RuntimeException ex){log.error("Voice finalization scheduling failed deviceId={} turnId={}",device,id,ex);failTurn(device,state,"VOICE_OPERATION_FAILED");}
@@ -173,18 +181,18 @@ public class DeviceGateway extends AbstractWebSocketHandler {
     private void scheduleRecording(String device,TurnState state){
         String id=state.turnId().toString();recordingTimers.computeIfAbsent(id,key->java.util.List.of(
                 timer.schedule(()->advance(device,state),Math.max(0,5_000-state.elapsedMs()),TimeUnit.MILLISECONDS),
-                timer.schedule(()->advance(device,state),Math.max(0,java.time.Duration.between(Instant.now(),deadlines.get(id)).toMillis()),TimeUnit.MILLISECONDS)));
+                timer.schedule(()->advance(device,state),Math.max(0,java.time.Duration.between(Instant.now(),deadlines.get(id)).toMillis())+1,TimeUnit.MILLISECONDS)));
     }
     private void cancelRecordingTimers(String id){var jobs=recordingTimers.remove(id);if(jobs!=null)jobs.forEach(f->f.cancel(false));}
     private void failTurn(String device,TurnState state,String code){synchronized(lockFor(device)){
         String id=state.turnId().toString();if(states.get(id)!=state)return;
         turns.fail(device,id,state.ownerVersion());coordinator.discard(device,id,state.attemptId().toString());release(id);
-        log.warn("Voice turn failed traceId={} deviceId={} turnId={} code={} deadlineType={}",TraceContext.current(),device,id,code,"ASR_FINAL_TIMEOUT".equals(code)?"PROCESSING":"NONE");
-        WebSocketSession socket=deviceSockets.get(device);if(socket!=null)sendError(socket,code,"ASR_BUSY".equals(code)||"MISSING_FRAMES".equals(code));
+        String trace=traceId();log.warn("Voice turn failed traceId={} deviceId={} turnId={} code={} deadlineType={}",trace,device,id,code,"ASR_FINAL_TIMEOUT".equals(code)?"PROCESSING":"NONE");
+        WebSocketSession socket=deviceSockets.get(device);if(socket!=null)sendError(socket,code,"ASR_BUSY".equals(code)||"MISSING_FRAMES".equals(code),trace);
     }}
     private void deliverFinal(WebSocketSession session,String device,TurnState state)throws Exception{
         String turnId=state.turnId().toString();
-        if(coordinator.state(device)==VoiceTurnCoordinator.State.FAILED){String code=coordinator.failureCode(device);turns.fail(device,turnId,state.ownerVersion());release(turnId);sendError(session,code,false);return;}
+        if(coordinator.state(device)==VoiceTurnCoordinator.State.FAILED){failTurn(device,state,coordinator.failureCode(device));return;}
         if(coordinator.state(device)==VoiceTurnCoordinator.State.DIALOGUE_PENDING){
             synchronized(lockFor(device)){
                 if(states.get(turnId)!=state)return;
@@ -199,7 +207,7 @@ public class DeviceGateway extends AbstractWebSocketHandler {
         if(session!=null&&session.isOpen())send(session,Map.of("version",1,"type","final","turnId",turnId,"text",text,"finalVersion",1,"asrAttemptId",state.attemptId().toString(),"command",command));
     }
 
-    private void cancel(WebSocketSession session,String device,JsonNode payload)throws Exception{String id=payload.path("turnId").asText("");TurnState state=requireOwner(session,device,id);var stop=coordinator.cancel(device,id,state.attemptId().toString());turns.cancel(device,id,state.ownerVersion());release(id);var response=new java.util.LinkedHashMap<String,Object>();response.put("version",1);response.put("type","cancelled");response.put("turnId",id);if(stop!=null)response.put("command",stop);send(session,response);}
+    private void cancel(WebSocketSession session,String device,JsonNode payload)throws Exception{synchronized(lockFor(device)){String id=payload.path("turnId").asText("");TurnState state=requireOwner(session,device,id);turns.cancel(device,id,state.ownerVersion());var stop=coordinator.cancel(device,id,state.attemptId().toString());release(id);var response=new java.util.LinkedHashMap<String,Object>();response.put("version",1);response.put("type","cancelled");response.put("turnId",id);if(stop!=null)response.put("command",stop);send(session,response);}}
     private void acknowledgeFinal(WebSocketSession session,String device,JsonNode payload)throws Exception{String id=payload.path("turnId").asText("");long owner=owner(session,id);if(deviceSockets.get(device)!=session)throw new ProtocolError("STALE_OWNER",false);if(coordinator.state(device)==VoiceTurnCoordinator.State.PLAYING||commands.hasPendingPlayback(device,id))throw new ProtocolError("PLAYBACK_PENDING",false);turns.acknowledgeFinal(device,id,owner);release(id);send(session,Map.of("version",1,"type","acknowledged","turnId",id));}
     private void acknowledgeCommand(WebSocketSession session,String device,JsonNode payload)throws Exception{String id=payload.path("turnId").asText(""),commandId=payload.path("commandId").asText("");long owner=owner(session,id);if(deviceSockets.get(device)!=session)throw new ProtocolError("STALE_OWNER",false);if(coordinator.state(device)==VoiceTurnCoordinator.State.PLAYING)coordinator.commandAck(device,id,commandId);else if(!commands.acknowledge(device,id,commandId))throw new ProtocolError("COMMAND_EXPIRED",false);send(session,Map.of("version",1,"type","command_acknowledged","turnId",id,"commandId",commandId,"ownerVersion",owner));}
     private void playbackFinished(WebSocketSession session,String device,JsonNode payload)throws Exception{
@@ -233,11 +241,12 @@ public class DeviceGateway extends AbstractWebSocketHandler {
     private void bind(WebSocketSession session,String device,String turn,long owner){WebSocketSession previous=deviceSockets.put(device,session);if(previous!=null&&previous!=session&&previous.isOpen())try{previous.close(CloseStatus.NORMAL.withReason("connection replaced"));}catch(Exception ignored){}sessionTurns.put(session.getId(),turn);sessionOwners.put(session.getId(),owner);}
     private void reserveState(VoiceTurnService.Turn turn){if(activeTurns.incrementAndGet()>maxTurns){activeTurns.decrementAndGet();throw new ProtocolError("VOICE_CAPACITY_EXCEEDED",true);}}
     private Object lockFor(String device){return deviceLocks[(device.hashCode()&0x7fffffff)%deviceLocks.length];}
-    private void release(String turn){if(states.remove(turn)!=null)activeTurns.decrementAndGet();formats.remove(turn);turnDevices.remove(turn);deadlines.remove(turn);disconnectTimes.remove(turn);cancelRecordingTimers(turn);var job=finalizations.remove(turn);if(job!=null){if(job.timeout!=null)job.timeout.cancel(false);if(job.work!=null)job.work.cancel(true);}}
+    private void release(String turn){if(states.remove(turn)!=null)activeTurns.decrementAndGet();formats.remove(turn);turnDevices.remove(turn);deadlines.remove(turn);disconnectTimes.remove(turn);cancelRecordingTimers(turn);var job=finalizations.remove(turn);if(job!=null){if(job.timeout!=null)job.timeout.cancel(false);if(job.work!=null&&job.runningThread!=Thread.currentThread())job.work.cancel(true);}}
     private void sendAck(WebSocketSession s,String id,TurnState state)throws Exception{send(s,Map.of("version",1,"type","ack","turnId",id,"receivedThrough",state.receivedThrough(),"missingRanges",state.missingRanges()));}
     private boolean isRetryable(ApiException ex){return ex.status()==HttpStatus.TOO_MANY_REQUESTS||ex.status()==HttpStatus.SERVICE_UNAVAILABLE||ex.status()==HttpStatus.GATEWAY_TIMEOUT;}
+    private String traceId(){String current=TraceContext.current();return current==null?UUID.randomUUID().toString():current;}
     private void sendError(WebSocketSession s,String code,boolean retryable){sendError(s,code,retryable,UUID.randomUUID().toString());}
-    private void sendError(WebSocketSession s,String code,boolean retryable,String traceId){try{send(s,Map.of("version",1,"type","error","code",code,"retryable",retryable,"traceId",traceId));}catch(Exception ignored){}}
+    private void sendError(WebSocketSession s,String code,boolean retryable,String traceId){try{send(s,Map.of("version",1,"type","error","code",code,"retryable",retryable,"traceId",traceId));}catch(Exception ex){log.warn("Voice error delivery failed traceId={} code={}",traceId,code,ex);}}
     private void send(WebSocketSession s,Object event)throws Exception{synchronized(s){if(s.isOpen())s.sendMessage(new TextMessage(mapper.writeValueAsString(event)));}}
     @Override protected void handleBinaryMessage(WebSocketSession session,BinaryMessage message)throws Exception{try{binary(session,message);}catch(ProtocolError ex){if("FORMAT_MISMATCH".equals(ex.code))failCurrent(session,(String)session.getAttributes().get("deviceId"));sendError(session,ex.code,ex.retryable);}catch(AudioFrameCodec.FrameException ex){VoiceTurnCoordinator.State state=coordinator.state((String)session.getAttributes().get("deviceId"));if(state==VoiceTurnCoordinator.State.LISTENING||state==VoiceTurnCoordinator.State.SPEAKING)failCurrent(session,(String)session.getAttributes().get("deviceId"));sendError(session,ex.code(),false);}catch(RuntimeException ex){VoiceTurnCoordinator.State state=coordinator.state((String)session.getAttributes().get("deviceId"));if(state==VoiceTurnCoordinator.State.LISTENING||state==VoiceTurnCoordinator.State.SPEAKING)failCurrent(session,(String)session.getAttributes().get("deviceId"));sendError(session,"INVALID_AUDIO_EVENT",false);}}
     @Override public void afterConnectionEstablished(WebSocketSession session){}
@@ -258,11 +267,11 @@ public class DeviceGateway extends AbstractWebSocketHandler {
             advance(device,s);
         }catch(Exception ex){log.error("Voice cleanup failed deviceId={} turnId={}",device,id,ex);}}
     });}
-    private void failCurrent(WebSocketSession session,String device){if(device==null)return;String id=sessionTurns.get(session.getId());TurnState s=id==null?null:states.get(id);Long owner=sessionOwners.get(session.getId());if(s!=null&&owner!=null&&owner==s.ownerVersion()&&deviceSockets.get(device)==session){try{turns.fail(device,id,owner);release(id);}catch(RuntimeException ignored){}}}
+    private void failCurrent(WebSocketSession session,String device){if(device==null)return;String id=sessionTurns.get(session.getId());TurnState s=id==null?null:states.get(id);Long owner=sessionOwners.get(session.getId());if(s!=null&&owner!=null&&owner==s.ownerVersion()&&deviceSockets.get(device)==session){try{failTurn(device,s,"INVALID_AUDIO_EVENT");}catch(RuntimeException ex){log.error("Voice failure cleanup failed deviceId={} turnId={}",device,id,ex);}}}
     @PreDestroy public void close(){timer.shutdownNow();finalizations.values().forEach(job->{if(job.work!=null)job.work.cancel(true);});states.forEach((id,s)->{String device=turnDevices.get(id);if(device!=null)coordinator.discard(device,id,s.attemptId().toString());});}
     private static final class FinalizationJob {
-        final long owner;final Instant deadline;volatile java.util.concurrent.Future<?> work;volatile java.util.concurrent.ScheduledFuture<?> timeout;
-        FinalizationJob(long owner,Instant deadline){this.owner=owner;this.deadline=deadline;}
+        final long owner;final Instant deadline;final String traceId;volatile Thread runningThread;volatile java.util.concurrent.Future<?> work;volatile java.util.concurrent.ScheduledFuture<?> timeout;
+        FinalizationJob(long owner,Instant deadline,String traceId){this.owner=owner;this.deadline=deadline;this.traceId=traceId;}
     }
     private static final class ProtocolError extends RuntimeException{final String code;final boolean retryable;ProtocolError(String c,boolean r){code=c;retryable=r;}}
 }

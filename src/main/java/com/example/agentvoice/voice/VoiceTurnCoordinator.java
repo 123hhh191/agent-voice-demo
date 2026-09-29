@@ -39,7 +39,7 @@ public final class VoiceTurnCoordinator {
         turns.put(deviceId,new Turn(deviceId,turnId,attemptId,fixtureText,asr.open(attemptId,fixtureText)));
     }
     public synchronized void restart(String deviceId,String turnId,String attemptId,String fixtureText) {
-        Turn prior=turns.get(deviceId);if(prior!=null){prior.asr.cancel();prior.asr.close();}
+        Turn prior=turns.get(deviceId);if(prior!=null)closeAsr(prior,true);
         turns.put(deviceId,new Turn(deviceId,turnId,attemptId,fixtureText,asr.open(attemptId,fixtureText)));
     }
     public synchronized State accept(AudioEvent raw,long elapsedMs) {
@@ -47,7 +47,7 @@ public final class VoiceTurnCoordinator {
         AudioEvent frame=normalizer.normalize(raw); var endpoint=t.endpoint.accept(frame,elapsedMs);
         if(t.endpoint.seenSpeech())t.state=State.SPEAKING;
         if(endpoint.isPresent()&&endpoint.get()==EndpointDetector.Cause.NO_SPEECH)finalizeTurn(t,endpoint.get());
-        else {for(AsrEvent event:t.asr.submit(frame))applyAsr(t,event);if(t.asrError!=null){t.failureCode="ASR_FAILED";t.state=State.FAILED;t.asr.cancel();t.asr.close();}else endpoint.ifPresent(cause->finalizeTurn(t,cause));}
+        else {for(AsrEvent event:t.asr.submit(frame))applyAsr(t,event);if(t.asrError!=null){t.failureCode="ASR_FAILED";t.state=State.FAILED;closeAsr(t,true);}else endpoint.ifPresent(cause->finalizeTurn(t,cause));}
         return t.state;
     }
     public synchronized State end(String deviceId,String turnId,String attemptId) { Turn t=require(deviceId,turnId,attemptId);if(t.state!=State.LISTENING&&t.state!=State.SPEAKING)return t.state;finalizeTurn(t,t.endpoint.end().orElse(EndpointDetector.Cause.NO_SPEECH));return t.state; }
